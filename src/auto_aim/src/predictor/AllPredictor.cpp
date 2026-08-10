@@ -48,7 +48,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
             AimResult solve_armor_result = chosen_armor.solve_armor_result;
             armor_is_large = chosen_armor.is_large;
 
-            is_reset = false;
+            is_reset = true;
             last_com_time = std::chrono::steady_clock::now();
 
             last_pixel_horizontal_center_distance = std::abs(chosen_armor.center.x - static_cast<float>(frame.cols)/2.0);
