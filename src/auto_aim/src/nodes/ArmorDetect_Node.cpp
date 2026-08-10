@@ -32,7 +32,6 @@
 #include <cmath>
 #include "predictor/PredictorMain.h"
 // #include "2d_armor_detector/YOLOPoseArmorDetector.h"
-#include "predictor/PredictorSwitcher.h"
 #include "2d_armor_detector/Armor.h"
 #include "communication/WatchdogClient.h"
 #include "visualizer/RestFrameDraw.h"
@@ -703,7 +702,7 @@ private:
             }
             headIMUInfos.last_auto_aim_switch = auto_aim_switch;
             PredictorResult predictor_result = predictor_main_ -> step(classifyResults_withSolveArmorResult, frame, 
-                                                                       PredictorType::AutoSwitch, ArmorType::Nearest, 
+                                                                       ArmorType::Nearest,
                                                                        auto_aim_switch, headIMUInfos.mcu_yaw_online); // Todo
             float mcu_command_pitch = predictor_result.command_pitch;
             float mcu_command_yaw = predictor_result.command_yaw;
@@ -733,7 +732,11 @@ private:
                 cv::FONT_HERSHEY_COMPLEX, 0.7, 
                 cv::Scalar(0, 255, 0), 1, 8, false);
             cv::putText(frame, 
-                "aiming "+ArmorType::ArmorTypeStrings[predictor_result.armor_type]+": "+PredictorType::PredictorTypeStrings[predictor_result.predictor_type], 
+                "aiming "+ArmorType::ArmorTypeStrings[predictor_result.armor_type]+": "+
+                    (predictor_result.armor_type == ArmorType::Outpost ||
+                             predictor_result.armor_type == ArmorType::Base
+                         ? "DIRECT"
+                         : "EKF"),
                 cv::Point2f(20, 110), 
                 cv::FONT_HERSHEY_COMPLEX, 0.7, 
                 cv::Scalar(0, 255, 0), 1, 8, false);

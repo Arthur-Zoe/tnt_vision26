@@ -11,7 +11,11 @@ void PredictorMain::update_serial_info(float bullet_velocity, float last_pitch_r
     }
 }
 
-PredictorResult PredictorMain::step(std::vector<ArmorResult>& classifyResults, cv::Mat& frame, PredictorType::PredictorType predictor_type, ArmorType::ArmorType priority_armor, bool auto_aim_switch, bool mcu_yaw_online) {
+PredictorResult PredictorMain::step(std::vector<ArmorResult>& classifyResults,
+                                    cv::Mat& frame,
+                                    ArmorType::ArmorType priority_armor,
+                                    bool auto_aim_switch,
+                                    bool mcu_yaw_online) {
 
     PredictorResult chosen_result;
 
@@ -30,7 +34,8 @@ PredictorResult PredictorMain::step(std::vector<ArmorResult>& classifyResults, c
         }
         if (all_predictors_[all_predictors_index] -> is_reset == false) {
             classified_predictor_results.push_back(
-                all_predictors_[all_predictors_index] -> step(classified_classifyResults[all_predictors_index], frame, predictor_type)
+                all_predictors_[all_predictors_index] -> step(
+                    classified_classifyResults[all_predictors_index], frame)
             );
             // RCLCPP_INFO(node->get_logger(), "%ld updating", all_predictors_index);
         }
