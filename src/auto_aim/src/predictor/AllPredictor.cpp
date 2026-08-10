@@ -1,4 +1,5 @@
 #include "predictor/AllPredictor.h"
+#include "utils/DataProcessFuncs.h"
 
 void AllPredictor::update_serial_info(float bullet_velocity, float last_pitch_rad_delayed, float last_yaw_rad_delayed, float total_yaw_rad_delayed) {
     bullet_velocity_ = bullet_velocity;
@@ -7,7 +8,7 @@ void AllPredictor::update_serial_info(float bullet_velocity, float last_pitch_ra
     total_yaw_rad_delayed_ = total_yaw_rad_delayed;
 }
 
-PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv::Mat& frame, PredictorType::PredictorType control_predictor_type)
+PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv::Mat& frame)
 {
     PredictorResult result;
 
@@ -24,16 +25,10 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
     result.integrating = true;
 
 
-    if (armor_class != ArmorType::Base) {
-        // using_predictor_type = predictor_switcher_ -> step();
-        if(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - latest_predicting_start_time).count()
-            < pre_predict_time) {
-
-            using_predictor_type = PredictorType::None;
-        } else {
-            using_predictor_type = predictor_switcher_ -> step();
-        }
-    }
+    const bool ekf_warmup_complete =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - latest_predicting_start_time)
+            .count() >= pre_predict_time;
     if (!classifyResults.empty()) {
         // 选择最佳目标（置信度最高）
         auto it = std::max_element(
@@ -82,7 +77,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
             total_delay = bullet_time + extra_predict_time;
             last_total_delay_ = total_delay;
 
-            // 默认使用 None （直接瞄准装甲板）
+            // Direct observation is the safe fallback for Base, Outpost and EKF warm-up.
             predicted_armor_pos = rest_frame_pos;
             predicted_aim_pos = predicted_armor_pos;
             fire_flag = true;
@@ -96,24 +91,25 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
         }
     } else {
         if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - last_com_time).count() >= reset_predictor_time) {
-            if (rotation_motion_model_) {
-                RotationMotionState RMMstate = rotation_motion_model_ -> getState();
-                if (RMMstate.update_frames > 90) init_r = (RMMstate.r_now + RMMstate.r_another) / 2.0;
+            if (ekf_target_predictor_) {
+                EKFTargetState ekf_state = ekf_target_predictor_->state();
+                if (ekf_state.update_frames > 90) {
+                    init_r = (ekf_state.r1 + ekf_state.r2) / 2.0;
+                }
                 if (!(init_r >= 200.0)) init_r = 200.0; // 限位，同时防止nan传播
                 if (!(init_r <= 400.0)) init_r = 400.0;
-                rotation_motion_model_.reset();
+                ekf_target_predictor_.reset();
             }
             is_reset = true;
             last_pixel_horizontal_center_distance = 1e10;
             has_valid_ballistic = false;
-            RMM_fire_control_data.new_target = true;
+            ekf_fire_control_data.new_target = true;
             latest_armor_distance = 1e10;
 
             result.reset = true;
             result.command_delta_pitch = 0.0;
             result.command_delta_yaw = 0.0;
             result.fire_flag = false;
-            result.predictor_type = using_predictor_type;
             result.armor_type = armor_class;
             result.pixel_horizontal_center_distance = last_pixel_horizontal_center_distance;
             result.latest_armor_distance = latest_armor_distance;
@@ -132,8 +128,10 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
 
 
 
-    if (armor_class != ArmorType::Base) {
-        // ========================== RotationMotionModel ===========================
+    // The validated RobustArmorTracker is a four-armor model. Outpost and Base
+    // intentionally keep direct current-observation aiming in this refactor.
+    if (armor_class != ArmorType::Base && armor_class != ArmorType::Outpost) {
+        // ========================== Robust EKF ===========================
 #ifdef USE_VIDEO
         // Standalone replay advances using the recorded/source frame time.
         // Using steady_clock here makes the EKF depend on OpenVINO/PnP runtime,
@@ -145,8 +143,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
             (std::chrono::steady_clock::now() - node_start_time).count() / 1e9;
 #endif
         bool RMM_updated_flag = false;
-        // Scratch canvas retained because legacy drawing code below still writes into it;
-        // the frame exposed to SHOW_WINDOWS is rebuilt from scratch as pure EKF later.
+        // Scratch canvas is rebuilt below as the pure Robust-EKF top view.
         cv::Mat RMM_visualize_frame = cv::Mat::zeros(800, 800, CV_8UC3);
         cv::Mat EKF_vertical_frame;
         cv::Mat EKF_camera_overlay_frame;
@@ -187,7 +184,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
             ekf_has_measurement = true;
             ekf_measurement_world = rest_frame_pos;
 
-            ObservedData RMM_update_data({
+            EKFTargetObservation RMM_update_data({
                 rest_frame_pos.x,
                 rest_frame_pos.y,
                 rest_frame_pos.z,
@@ -195,27 +192,23 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                 RMM_update_time
             });
 
-            bool recreate_model = !rotation_motion_model_;
-            if (rotation_motion_model_) {
-                const RotationMotionState s = rotation_motion_model_->getState();
+            bool recreate_model = !ekf_target_predictor_;
+            if (ekf_target_predictor_) {
+                const EKFTargetState s = ekf_target_predictor_->state();
                 recreate_model =
                     !(std::isfinite(s.center_x) && std::isfinite(s.center_y) &&
-                      std::isfinite(s.center_z) && std::isfinite(s.z_another) &&
+                      std::isfinite(s.center_z) && std::isfinite(s.h) &&
                       std::isfinite(s.center_vx) && std::isfinite(s.center_vy) &&
-                      std::isfinite(s.center_vz) && std::isfinite(s.r_now) &&
-                      std::isfinite(s.r_another) && std::isfinite(s.yaw) &&
-                      std::isfinite(s.total_yaw) && std::isfinite(s.vyaw));
+                      std::isfinite(s.center_vz) && std::isfinite(s.r1) &&
+                      std::isfinite(s.r2) && std::isfinite(s.yaw) &&
+                      std::isfinite(s.w));
             }
 
             if (recreate_model) {
-                rotation_motion_model_ = std::make_shared<RotationMotionModel>(
-                    RMM_update_data,
-                    rest_frame_,
-                    armor_class == ArmorType::Outpost,
-                    init_r,
-                    config_file_ptr);
+                ekf_target_predictor_ = std::make_shared<EKFTargetPredictor>(
+                    RMM_update_data, init_r, config_file_ptr);
             } else {
-                rotation_motion_model_->update(RMM_update_data);
+                ekf_target_predictor_->update(RMM_update_data);
             }
 
             RMM_updated_flag = true;
@@ -242,33 +235,17 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                             RMM_visualize_zoom_out_factor)),
                 cv::Scalar(255, 255, 0), 2);
 
-            const double theoretic_yaw =
-                rotation_motion_model_->getTheoreticYaw(
-                    rest_frame_pos.x, rest_frame_pos.y);
-            cv::line(
-                RMM_visualize_frame,
-                cv::Point2f(
-                    400 + rest_frame_pos.x / RMM_visualize_zoom_out_factor,
-                    400 - rest_frame_pos.y / RMM_visualize_zoom_out_factor),
-                cv::Point2f(
-                    400 + rest_frame_pos.x / RMM_visualize_zoom_out_factor +
-                        std::sin(theoretic_yaw) * 500 /
-                            RMM_visualize_zoom_out_factor,
-                    400 - (rest_frame_pos.y / RMM_visualize_zoom_out_factor -
-                        std::cos(theoretic_yaw) * 500 /
-                            RMM_visualize_zoom_out_factor)),
-                cv::Scalar(0, 255, 0), 2);
         }
 
-        if (!RMM_updated_flag && rotation_motion_model_) {
+        if (!RMM_updated_flag && ekf_target_predictor_) {
             // Robust backend performs pure predict/TEMP_LOST here; no pseudo-measurement update.
-            rotation_motion_model_->emptyUpdate(RMM_update_time);
+            ekf_target_predictor_->missUpdate(RMM_update_time);
         }
 
 
 
-        if(rotation_motion_model_) {
-            PredictResult RMM_pred_now_data = rotation_motion_model_ -> predict(0.0);
+        if(ekf_target_predictor_) {
+            EKFTargetPrediction RMM_pred_now_data = ekf_target_predictor_ -> predict(0.0);
             cv::Point3f RMM_pred_now_center_p3f = rest_frame_ -> worldToPnpP3f({
                 static_cast<float>(RMM_pred_now_data.center_x), 
                 static_cast<float>(RMM_pred_now_data.center_y), 
@@ -286,7 +263,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                 cv::circle(RMM_visualize_frame, cv::Point2f(400+RMM_pred_now_data.center_x/RMM_visualize_zoom_out_factor, 400-RMM_pred_now_data.center_y/RMM_visualize_zoom_out_factor), 8, cv::Scalar(255, 0, 255), 2);
             }
             for (int RMM_pred_now_armor_i = 0; RMM_pred_now_armor_i < RMM_pred_now_data.armors.size(); RMM_pred_now_armor_i += 1) {
-                SimpleArmor& RMM_pred_now_armor = RMM_pred_now_data.armors[RMM_pred_now_armor_i];
+                EKFPredictedArmor& RMM_pred_now_armor = RMM_pred_now_data.armors[RMM_pred_now_armor_i];
                 cv::Point3f RMM_pred_now_armor_p3f = rest_frame_ -> worldToPnpP3f({
                     static_cast<float>(RMM_pred_now_armor.x), 
                     static_cast<float>(RMM_pred_now_armor.y), 
@@ -304,10 +281,10 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                 //     cv::Scalar(255 - RMM_pred_now_armor_i * 60, 0, RMM_pred_now_armor_i * 60), 2);
             }
 
-            RotationMotionState RMM_state = rotation_motion_model_ -> getState();
-            RotationMotionDebugState RMM_debug = rotation_motion_model_ -> getDebugState();
+            EKFTargetState RMM_state = ekf_target_predictor_->state();
+            EKFTargetDebugState RMM_debug = ekf_target_predictor_->debugState();
             cv::putText(RMM_visualize_frame, 
-                "RMM_state vyaw:"+std::to_string(RMM_state.vyaw), 
+                "EKF w:"+std::to_string(RMM_state.w),
                 cv::Point2f(20,80), 
                 cv::FONT_HERSHEY_COMPLEX, 0.7, 
                 cv::Scalar(0, 255, 0), 1, 8, false);
@@ -316,24 +293,22 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                 cv::Point2f(20,110), 
                 cv::FONT_HERSHEY_COMPLEX, 0.7, 
                 cv::Scalar(0, 255, 0), 1, 8, false);
-            if (RMM_debug.robust_ekf_active) {
-                cv::putText(RMM_visualize_frame,
-                    "EKF:"+RMM_debug.tracker_state+
-                    " id:"+std::to_string(RMM_debug.matched_id)+
-                    " NIS:"+std::to_string(RMM_debug.nis),
-                    cv::Point2f(20,320),
-                    cv::FONT_HERSHEY_COMPLEX, 0.55,
-                    cv::Scalar(0, 255, 255), 1, 8, false);
-                cv::putText(RMM_visualize_frame,
-                    "phase_w:"+std::to_string(RMM_debug.phase_w_filtered)+
-                    (RMM_debug.direction_reversal ? " REVERSAL" : ""),
-                    cv::Point2f(20,345),
-                    cv::FONT_HERSHEY_COMPLEX, 0.55,
-                    RMM_debug.direction_reversal ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 255, 255),
-                    1, 8, false);
-            }
-            if (using_predictor_type == PredictorType::RotationMotionModel) {
-                PredictResult RMM_pred_aim_data = rotation_motion_model_ -> predict(total_delay);
+            cv::putText(RMM_visualize_frame,
+                "EKF:"+RMM_debug.tracker_state+
+                " id:"+std::to_string(RMM_debug.matched_id)+
+                " NIS:"+std::to_string(RMM_debug.nis),
+                cv::Point2f(20,320),
+                cv::FONT_HERSHEY_COMPLEX, 0.55,
+                cv::Scalar(0, 255, 255), 1, 8, false);
+            cv::putText(RMM_visualize_frame,
+                "phase_w:"+std::to_string(RMM_debug.phase_w_filtered)+
+                (RMM_debug.direction_reversal ? " REVERSAL" : ""),
+                cv::Point2f(20,345),
+                cv::FONT_HERSHEY_COMPLEX, 0.55,
+                RMM_debug.direction_reversal ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 255, 255),
+                1, 8, false);
+            if (ekf_warmup_complete && ekf_target_predictor_->ready()) {
+                EKFTargetPrediction RMM_pred_aim_data = ekf_target_predictor_ -> predict(total_delay);
                 cv::Point2d cam_to_center_vector = {RMM_pred_aim_data.center_x - cam_position[0], RMM_pred_aim_data.center_y - cam_position[1]};
                 double cam_to_center_vector_norm = cv::norm(cam_to_center_vector);
                 cv::Point2d unit_cam_to_center_vector = cv::Point2d(0.0, 1.0);
@@ -344,7 +319,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                 float choose_armor_yaw_bias_with_direction = choose_armor_yaw_bias;
                 choose_armor_yaw_bias_with_direction *= static_cast<float>(RMM_pred_aim_data.rotation_direction);
                 for (int RMM_pred_aim_armor_i = 0; RMM_pred_aim_armor_i < RMM_pred_aim_data.armors.size(); RMM_pred_aim_armor_i += 1) {
-                    SimpleArmor& RMM_pred_aim_armor = RMM_pred_aim_data.armors[RMM_pred_aim_armor_i];
+                    EKFPredictedArmor& RMM_pred_aim_armor = RMM_pred_aim_data.armors[RMM_pred_aim_armor_i];
                     cv::Point2d yaw_vector = {std::sin(RMM_pred_aim_armor.yaw + choose_armor_yaw_bias_with_direction), -std::cos(RMM_pred_aim_armor.yaw + choose_armor_yaw_bias_with_direction)};
                     unit_center_v_dot_yaw[RMM_pred_aim_armor_i] = cam_to_center_vector.dot(yaw_vector);
                 }
@@ -353,15 +328,15 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                 auto second_nearest_armor = RMM_pred_aim_data.armors[nearest_two_idx.second];
                 auto chosen_armor = nearest_armor;
 
-                if (abs(RMM_state.vyaw) < RMM_fire_control_data.low_vyaw_threshold) {
+                if (abs(RMM_state.w) < ekf_fire_control_data.low_vyaw_threshold) {
                     cv::Point2d yaw_vector_1 = {std::sin(nearest_armor.yaw), -std::cos(nearest_armor.yaw)};
                     double yaw_bias_1 = acos(-unit_cam_to_center_vector.dot(yaw_vector_1));
                     cv::Point2d yaw_vector_2 = {std::sin(second_nearest_armor.yaw), -std::cos(second_nearest_armor.yaw)};
                     double yaw_bias_2 = acos(-unit_cam_to_center_vector.dot(yaw_vector_2));
-                    if (abs(yaw_bias_1 - yaw_bias_2) < RMM_fire_control_data.low_vyaw_change_target_delta_yaw_threshold) {
-                        float delta_yaw_1 = nearest_armor.yaw - RMM_fire_control_data.last_target_yaw;
+                    if (abs(yaw_bias_1 - yaw_bias_2) < ekf_fire_control_data.low_vyaw_change_target_delta_yaw_threshold) {
+                        float delta_yaw_1 = nearest_armor.yaw - ekf_fire_control_data.last_target_yaw;
                         delta_yaw_1 = atan2(sin(delta_yaw_1), cos(delta_yaw_1));
-                        float delta_yaw_2 = second_nearest_armor.yaw - RMM_fire_control_data.last_target_yaw;
+                        float delta_yaw_2 = second_nearest_armor.yaw - ekf_fire_control_data.last_target_yaw;
                         delta_yaw_2 = atan2(sin(delta_yaw_2), cos(delta_yaw_2));
                         if (abs(delta_yaw_1) < abs(delta_yaw_2)) {
                             chosen_armor = nearest_armor;
@@ -377,10 +352,15 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                     static_cast<float>(chosen_armor.z) 
                 };
 
-                float chosen_armor_yaw_bias = (chosen_armor.yaw - (rotation_motion_model_ -> getCamToCenterYaw())) * static_cast<float>(RMM_pred_aim_data.rotation_direction);
+                const double cam_to_center_yaw = std::atan2(
+                    -(RMM_pred_aim_data.center_x - cam_position[0]),
+                    RMM_pred_aim_data.center_y - cam_position[1]);
+                float chosen_armor_yaw_bias =
+                    (chosen_armor.yaw - cam_to_center_yaw) *
+                    static_cast<float>(RMM_pred_aim_data.rotation_direction);
                 chosen_armor_yaw_bias = atan2(sin(chosen_armor_yaw_bias), cos(chosen_armor_yaw_bias));
 
-                RMM_fire_result_t RMM_fire_result = RMM_fire_control(chosen_armor, RMM_state, chosen_armor_yaw_bias, armor_is_large, cam_to_center_vector, choose_armor_yaw_bias_with_direction);
+                EKF_fire_result_t RMM_fire_result = EKF_fire_control(chosen_armor, RMM_state, chosen_armor_yaw_bias, armor_is_large, cam_to_center_vector, choose_armor_yaw_bias_with_direction);
                 if (RMM_fire_result.aim_center) {
                     cv::Point2d reverse_straight_r_vector = unit_cam_to_center_vector * chosen_armor.r;
                     cv::Point2d cam_to_center_vector_subtract_r = cam_to_center_vector - reverse_straight_r_vector;
@@ -394,7 +374,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                 }
                 fire_flag = RMM_fire_result.fire;
                 // Keep aiming continuous, but do not fire unless the robust tracker is stably TRACKING.
-                if (!rotation_motion_model_->isTrackerReady() ||
+                if (!ekf_target_predictor_->ready() ||
                     RMM_debug.armor_switched ||
                     RMM_debug.recovered ||
                     RMM_debug.direction_reversal) {
@@ -411,17 +391,17 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                     cv::Point2f(400+predicted_aim_pos.x/RMM_visualize_zoom_out_factor, 400-predicted_aim_pos.y/RMM_visualize_zoom_out_factor), 8, 
                     cv::Scalar(0, 255, 255), 2);
                 cv::putText(RMM_visualize_frame, 
-                    "r_now:"+std::to_string(RMM_pred_aim_data.r_now), 
+                    "r1:"+std::to_string(RMM_pred_aim_data.r1),
                     cv::Point2f(20,140), 
                     cv::FONT_HERSHEY_COMPLEX, 0.7, 
                     cv::Scalar(0, 255, 0), 1, 8, false);
                 cv::putText(RMM_visualize_frame, 
-                    "r_another:"+std::to_string(RMM_pred_aim_data.r_another), 
+                    "r2:"+std::to_string(RMM_pred_aim_data.r2),
                     cv::Point2f(300,140), 
                     cv::FONT_HERSHEY_COMPLEX, 0.7, 
                     cv::Scalar(0, 255, 0), 1, 8, false);
                 cv::putText(RMM_visualize_frame, 
-                    "flip:"+std::to_string(rotation_motion_model_ -> debug_flip_flag), 
+                    "flip:"+std::to_string(ekf_target_predictor_->debugFlipFlag()),
                     cv::Point2f(580,140), 
                     cv::FONT_HERSHEY_COMPLEX, 0.7, 
                     cv::Scalar(0, 255, 0), 1, 8, false);
@@ -431,7 +411,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                     cv::FONT_HERSHEY_COMPLEX, 0.7, 
                     cv::Scalar(0, 255, 0), 1, 8, false);
                 cv::putText(RMM_visualize_frame, 
-                    "z_another:"+std::to_string(RMM_pred_aim_data.z_another), 
+                    "alternate_z:"+std::to_string(RMM_pred_aim_data.alternate_z),
                     cv::Point2f(300,170), 
                     cv::FONT_HERSHEY_COMPLEX, 0.7, 
                     cv::Scalar(0, 255, 0), 1, 8, false);
@@ -468,8 +448,8 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                 cv::Scalar(255, 255, 0), 2);
             cv::line(RMM_visualize_frame, 
                 cv::Point2f(400+RMM_pred_now_data.center_x/RMM_visualize_zoom_out_factor, 400-RMM_pred_now_data.center_y/RMM_visualize_zoom_out_factor),
-                cv::Point2f(400+RMM_pred_now_data.center_x/RMM_visualize_zoom_out_factor + std::sin(RMM_state.total_yaw)*1000/RMM_visualize_zoom_out_factor, 
-                            400-RMM_pred_now_data.center_y/RMM_visualize_zoom_out_factor + std::cos(RMM_state.total_yaw)*1000/RMM_visualize_zoom_out_factor),
+                cv::Point2f(400+RMM_pred_now_data.center_x/RMM_visualize_zoom_out_factor + std::sin(RMM_state.yaw)*1000/RMM_visualize_zoom_out_factor,
+                            400-RMM_pred_now_data.center_y/RMM_visualize_zoom_out_factor + std::cos(RMM_state.yaw)*1000/RMM_visualize_zoom_out_factor),
                 cv::Scalar(255, 0, 255), 2);
 
             // -----------------------------------------------------------------
@@ -478,7 +458,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
             // measurement + EKF center + four armor hypotheses + matched-id
             // highlight + yaw arrows + NIS/residual/phase diagnostics.
             // -----------------------------------------------------------------
-            if (RMM_debug.robust_ekf_active) {
+            {
                 constexpr int kTopSize = 900;
                 constexpr int kVerticalWidth = 900;
                 constexpr int kVerticalHeight = 260;
@@ -600,7 +580,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                         RMM_state.center_y / 1000.0,
                         RMM_state.center_z / 1000.0,
                         RMM_state.yaw * 180.0 / M_PI,
-                        RMM_state.vyaw),
+                        RMM_state.w),
                     cv::Point(14, 49), cv::FONT_HERSHEY_SIMPLEX, 0.50,
                     cv::Scalar(50, 50, 50), 1, cv::LINE_AA);
 
@@ -800,7 +780,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                     "EKF " + RMM_debug.tracker_state +
                         "  matched=" + std::to_string(RMM_debug.matched_id) +
                         cv::format("  w=%.2f  NIS=%.2f",
-                                   RMM_state.vyaw, RMM_debug.nis),
+                                   RMM_state.w, RMM_debug.nis),
                     cv::Point(14, 28), cv::FONT_HERSHEY_SIMPLEX, 0.58,
                     cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
 
@@ -808,13 +788,9 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                 result.info_images.EKF_vertical_frame = EKF_vertical_frame;
                 result.info_images.EKF_camera_overlay_frame =
                     EKF_camera_overlay_frame;
-            } else {
-                result.info_images.RMM_visualize_frame.release();
-                result.info_images.EKF_vertical_frame.release();
-                result.info_images.EKF_camera_overlay_frame.release();
             }
         }
-        // ========================== RotationMotionModsel =========================== END
+        // ========================== Robust EKF =========================== END
     }
 
     // 统一转换回pnp相机坐标系    
@@ -889,13 +865,15 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
     // oscilloscope_common_ -> show();
     result.info_images.common_debug_oscilloscope_frame = oscilloscope_common_ -> getDisplay();
 
-    std::string using_predictor_type_string = PredictorType::PredictorTypeStrings[using_predictor_type];
+    const std::string predictor_status =
+        (armor_class == ArmorType::Base || armor_class == ArmorType::Outpost)
+            ? "DIRECT"
+            : "EKF";
     cv::putText(frame, 
-        "Class "+std::to_string(armor_class)+": "+using_predictor_type_string, 
+        "Class "+std::to_string(armor_class)+": "+predictor_status,
         cv::Point2f(frame.cols - 200, 50 + 30 * armor_class), 
         cv::FONT_HERSHEY_COMPLEX, 0.7, 
         cv::Scalar(0, 255, 0), 1, 8, false);
-    result.predictor_type = using_predictor_type;
     result.armor_type = armor_class;
     result.pixel_horizontal_center_distance = last_pixel_horizontal_center_distance;
     result.latest_armor_distance = latest_armor_distance;
@@ -912,37 +890,33 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
 }
 
 
-RMM_fire_result_t AllPredictor::RMM_fire_control(SimpleArmor chosen_armor, RotationMotionState RMM_state, float yaw_bias, bool is_large_armor, cv::Point2d cam_to_center_vector, float choose_armor_yaw_bias_with_direction) {
-    RMM_fire_result_t result;
+EKF_fire_result_t AllPredictor::EKF_fire_control(EKFPredictedArmor chosen_armor, EKFTargetState ekf_state, float yaw_bias, bool is_large_armor, cv::Point2d cam_to_center_vector, float choose_armor_yaw_bias_with_direction) {
+    EKF_fire_result_t result{};
 
     std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-    if (RMM_fire_control_data.new_target) {
-        RMM_fire_control_data.last_target_yaw_jump_time = now;
-        RMM_fire_control_data.new_target = false;
+    if (ekf_fire_control_data.new_target) {
+        ekf_fire_control_data.last_target_yaw_jump_time = now;
+        ekf_fire_control_data.new_target = false;
     } else {
-        float yaw_diff = RMM_fire_control_data.last_target_yaw - chosen_armor.yaw;
+        float yaw_diff = ekf_fire_control_data.last_target_yaw - chosen_armor.yaw;
         yaw_diff = std::atan2(std::sin(yaw_diff), std::cos(yaw_diff));
         if (fabs(yaw_diff) > M_PI / 4.0) {
-            RMM_fire_control_data.last_target_yaw_jump_time = now;
+            ekf_fire_control_data.last_target_yaw_jump_time = now;
         }
     }
-    RMM_fire_control_data.last_target_yaw = chosen_armor.yaw;
+    ekf_fire_control_data.last_target_yaw = chosen_armor.yaw;
 
-    if (armor_class != ArmorType::Outpost) {
-        if (fabs(RMM_state.vyaw) > RMM_fire_control_data.aim_center_vyaw_upper_threshold) {
-            RMM_fire_control_data.aim_center_schmitt_trigger = true;
-        } else if (fabs(RMM_state.vyaw) < RMM_fire_control_data.aim_center_vyaw_lower_threshold) {
-            RMM_fire_control_data.aim_center_schmitt_trigger = false;
-        }
-    } else {
-        RMM_fire_control_data.aim_center_schmitt_trigger = false;
+    if (fabs(ekf_state.w) > ekf_fire_control_data.aim_center_vyaw_upper_threshold) {
+        ekf_fire_control_data.aim_center_schmitt_trigger = true;
+    } else if (fabs(ekf_state.w) < ekf_fire_control_data.aim_center_vyaw_lower_threshold) {
+        ekf_fire_control_data.aim_center_schmitt_trigger = false;
     }
-    result.aim_center = RMM_fire_control_data.aim_center_schmitt_trigger;
+    result.aim_center = ekf_fire_control_data.aim_center_schmitt_trigger;
 
 
     if (result.aim_center) {
         float max_yaw_bias = std::atan2((is_large_armor ? ArmorConstants::LARGE_ARMOR_WIDTH : ArmorConstants::SMALL_ARMOR_WIDTH) / 2.0, 
-                                        chosen_armor.r) + RMM_fire_control_data.aim_center_yaw_bias_expand;
+                                        chosen_armor.r) + ekf_fire_control_data.aim_center_yaw_bias_expand;
         if (fabs(yaw_bias) < max_yaw_bias) {
             result.fire = true;
         } else {
@@ -950,16 +924,13 @@ RMM_fire_result_t AllPredictor::RMM_fire_control(SimpleArmor chosen_armor, Rotat
         }
     } else {
         int ms_sence_last_target_change = 
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - RMM_fire_control_data.last_target_yaw_jump_time).count();
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - ekf_fire_control_data.last_target_yaw_jump_time).count();
 
-        float ceasefire_armor_yaw = chosen_armor.yaw + RMM_state.vyaw * RMM_fire_control_data.before_target_change_ceasefire_ms / 1000.0;
+        float ceasefire_armor_yaw = chosen_armor.yaw + ekf_state.w * ekf_fire_control_data.before_target_change_ceasefire_ms / 1000.0;
         cv::Point2d ceasefire_armor_yaw_vector = {std::sin(ceasefire_armor_yaw + choose_armor_yaw_bias_with_direction), -std::cos(ceasefire_armor_yaw + choose_armor_yaw_bias_with_direction)};
         float ceasefire_armor_yaw_dot = cam_to_center_vector.dot(ceasefire_armor_yaw_vector);
 
-        float jump_yaw_rad = M_PI / 2.0;
-        if (armor_class == ArmorType::Outpost) {
-            jump_yaw_rad = M_PI * 2.0 / 3.0;
-        }
+        constexpr float jump_yaw_rad = M_PI / 2.0;
 
         float ceasefire_armor_yaw_1 = ceasefire_armor_yaw + jump_yaw_rad;
         cv::Point2d ceasefire_armor_yaw_vector_1 = {std::sin(ceasefire_armor_yaw_1 + choose_armor_yaw_bias_with_direction), -std::cos(ceasefire_armor_yaw_1 + choose_armor_yaw_bias_with_direction)};
@@ -970,13 +941,13 @@ RMM_fire_result_t AllPredictor::RMM_fire_control(SimpleArmor chosen_armor, Rotat
         float ceasefire_armor_yaw_dot_2 = cam_to_center_vector.dot(ceasefire_armor_yaw_vector_2);
 
         bool before_target_change_ceasefire_flag = false;
-        if (abs(RMM_state.vyaw) < RMM_fire_control_data.low_vyaw_threshold) {
+        if (abs(ekf_state.w) < ekf_fire_control_data.low_vyaw_threshold) {
             before_target_change_ceasefire_flag = false;
         } else if (ceasefire_armor_yaw_dot_1 < ceasefire_armor_yaw_dot || ceasefire_armor_yaw_dot_2 < ceasefire_armor_yaw_dot) {
             before_target_change_ceasefire_flag = true;
         }
 
-        if (ms_sence_last_target_change < RMM_fire_control_data.after_target_change_ceasefire_ms 
+        if (ms_sence_last_target_change < ekf_fire_control_data.after_target_change_ceasefire_ms
             || 
             before_target_change_ceasefire_flag
         ) {

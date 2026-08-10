@@ -16,8 +16,7 @@
 #include "3d_processing/RestFrame.h"
 #include "visualizer/DataVisualizer.h"
 #include "utils/SimpleDataFilter.h"
-#include "predictor/RotationMotionModel.h"
-#include "predictor/PredictorSwitcher.h"
+#include "EKF/EKFTargetPredictor.h"
 #include "macro/AutoAimMacro.h"
 
 struct PredictorResult {
@@ -27,7 +26,6 @@ struct PredictorResult {
     float command_delta_pitch = 0.0;
     float command_delta_yaw = 0.0;
     bool fire_flag = false;
-    PredictorType::PredictorType predictor_type = PredictorType::None;
     ArmorType::ArmorType armor_type = ArmorType::Hero;
     float pixel_horizontal_center_distance = 1e10;
     float latest_armor_distance = 1e10;
@@ -41,7 +39,7 @@ struct PredictorResult {
     } info_images;
 };
 
-struct RMM_fire_result_t {
+struct EKF_fire_result_t {
     bool aim_center;
     bool fire;
 };
@@ -78,15 +76,13 @@ public:
         oscilloscope_common_ -> setScale(2.0);
         oscilloscope_common_ -> setOffset(-1.0);
 
-        predictor_switcher_ = std::make_shared<PredictorSwitcher>(config_file_ptr, node);
-
-        RMM_fire_control_data.after_target_change_ceasefire_ms = (*config_file_ptr)["after_target_change_ceasefire_ms"].as<int>();
-        RMM_fire_control_data.before_target_change_ceasefire_ms = (*config_file_ptr)["before_target_change_ceasefire_ms"].as<int>();
-        RMM_fire_control_data.aim_center_vyaw_lower_threshold = (*config_file_ptr)["aim_center_vyaw_lower_threshold"].as<float>();
-        RMM_fire_control_data.aim_center_vyaw_upper_threshold = (*config_file_ptr)["aim_center_vyaw_upper_threshold"].as<float>();
-        RMM_fire_control_data.aim_center_yaw_bias_expand = (*config_file_ptr)["aim_center_yaw_bias_expand"].as<float>();
-        RMM_fire_control_data.low_vyaw_change_target_delta_yaw_threshold = M_PI / 180.0 * (*config_file_ptr)["low_vyaw_change_target_delta_yaw_threshold_degree"].as<float>();
-        RMM_fire_control_data.low_vyaw_threshold = (*config_file_ptr)["low_vyaw_threshold"].as<float>();
+        ekf_fire_control_data.after_target_change_ceasefire_ms = (*config_file_ptr)["after_target_change_ceasefire_ms"].as<int>();
+        ekf_fire_control_data.before_target_change_ceasefire_ms = (*config_file_ptr)["before_target_change_ceasefire_ms"].as<int>();
+        ekf_fire_control_data.aim_center_vyaw_lower_threshold = (*config_file_ptr)["aim_center_vyaw_lower_threshold"].as<float>();
+        ekf_fire_control_data.aim_center_vyaw_upper_threshold = (*config_file_ptr)["aim_center_vyaw_upper_threshold"].as<float>();
+        ekf_fire_control_data.aim_center_yaw_bias_expand = (*config_file_ptr)["aim_center_yaw_bias_expand"].as<float>();
+        ekf_fire_control_data.low_vyaw_change_target_delta_yaw_threshold = M_PI / 180.0 * (*config_file_ptr)["low_vyaw_change_target_delta_yaw_threshold_degree"].as<float>();
+        ekf_fire_control_data.low_vyaw_threshold = (*config_file_ptr)["low_vyaw_threshold"].as<float>();
 
         pre_predict_time = (*config_file_ptr)["pre_predict_time"].as<float>();
         pre_predict_time_not_aim = (*config_file_ptr)["pre_predict_time_not_aim"].as<float>();
@@ -102,14 +98,13 @@ public:
         robust_video_dt_s_ = 1.0 / configured_fps;
     }
 
-    PredictorResult step(std::vector<ArmorResult>& classifyResults, cv::Mat& frame, PredictorType::PredictorType control_predictor_type);
+    PredictorResult step(std::vector<ArmorResult>& classifyResults, cv::Mat& frame);
     void update_serial_info(float bullet_velocity, float last_pitch_rad_delayed, float last_yaw_rad_delayed, float total_yaw_rad_delayed);
 
     bool is_reset = false;
 
     std::chrono::steady_clock::time_point latest_predicting_start_time;
 private:
-    PredictorType::PredictorType using_predictor_type = PredictorType::None;
     ArmorType::ArmorType armor_class;
     bool armor_is_large;
 
@@ -125,7 +120,7 @@ private:
 
     std::shared_ptr<Oscilloscope> oscilloscope_common_;
 
-    std::shared_ptr<RotationMotionModel> rotation_motion_model_;
+    std::shared_ptr<EKFTargetPredictor> ekf_target_predictor_;
 
     float bullet_velocity_;
     float last_pitch_rad_delayed_ = 0;
@@ -138,8 +133,6 @@ private:
     std::chrono::steady_clock::time_point last_com_time;
     cv::Point2f last_aim_yaw_pitch_;
 
-    std::shared_ptr<PredictorSwitcher> predictor_switcher_;
-
     cv::Point3f last_rest_frame_pos = {0.0, 0.0, 0.0};
 
     float last_pixel_horizontal_center_distance = 1e10;
@@ -148,7 +141,7 @@ private:
     
     float init_r = 250.0;
 
-    struct RMM_fire_control_data_t {
+    struct EKF_fire_control_data_t {
         int after_target_change_ceasefire_ms;
         int before_target_change_ceasefire_ms;
         float aim_center_vyaw_lower_threshold;
@@ -161,9 +154,9 @@ private:
         bool new_target = true;
         float last_target_yaw;
         std::chrono::steady_clock::time_point last_target_yaw_jump_time;
-    } RMM_fire_control_data;
+    } ekf_fire_control_data;
 
-    RMM_fire_result_t RMM_fire_control(SimpleArmor chosen_armor, RotationMotionState RMM_state, float yaw_bias, bool is_large_armor, cv::Point2d cam_to_center_vector, float choose_armor_yaw_bias_with_direction);
+    EKF_fire_result_t EKF_fire_control(EKFPredictedArmor chosen_armor, EKFTargetState ekf_state, float yaw_bias, bool is_large_armor, cv::Point2d cam_to_center_vector, float choose_armor_yaw_bias_with_direction);
 
     float latest_armor_distance = 1e10;
 
