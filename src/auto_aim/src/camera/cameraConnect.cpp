@@ -162,6 +162,7 @@ void Camera::reconnectLoop() {
 
 void Camera::grabLoop() {
     std::cout << "Grab loop started." << std::endl;
+    std::uint64_t next_frame_id = 0;
     
     while (running.load()) {
         // 等待开始取流信号
@@ -222,6 +223,12 @@ void Camera::grabLoop() {
             nRet = MV_CC_GetOneFrameTimeout(handle, pData, nPayloadSize, &stImageInfo, 1000);
             
             if (nRet == MV_OK) {
+                // Timestamp the frame as soon as the SDK successfully returns it.
+                // Device timestamp fields are intentionally not used until their
+                // units, monotonicity and wrap behavior are verified.
+                const double frame_timestamp_s = duration<double>(
+                    steady_clock::now().time_since_epoch()).count();
+                const std::uint64_t frame_id = next_frame_id++;
                 // 检查帧数据完整性
                 if (stImageInfo.nFrameLen > 0) {
                     cv::Mat processedImage;
@@ -231,9 +238,11 @@ void Camera::grabLoop() {
                             lastValidImage = processedImage.clone();
                             lastSuccessTime = steady_clock::now();
                         }
-                        // 更新图像
+                        // Publish image and metadata in one critical section.
                         pthread_mutex_lock(&g_mutex);
-                        g_image = processedImage.clone();
+                        g_frame_packet.image = processedImage.clone();
+                        g_frame_packet.timestamp_s = frame_timestamp_s;
+                        g_frame_packet.frame_id = frame_id;
                         image_used = false;
                         pthread_mutex_unlock(&g_mutex);
                     }
@@ -646,4 +655,3 @@ std::vector<std::string> Camera::enumUSBDevices() {
     
     return deviceList;
 }
-

@@ -45,7 +45,7 @@ namespace fs = std::filesystem;
 #include "macro/AutoAimMacro.h"
 
 // 全局变量定义
-cv::Mat g_image;
+FramePacket g_frame_packet;
 pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 bool g_bExit = false;
 bool image_used = true;
@@ -121,10 +121,14 @@ public:
 
 
 #ifdef USE_VIDEO
-        video_input_ = std::make_shared<VideoInput>(ws_dir_path / (*config_file_ptr)["video_relative_path"].as<std::string>());
+        video_input_ = std::make_shared<VideoInput>(
+            ws_dir_path / (*config_file_ptr)["video_relative_path"].as<std::string>(),
+            frame_rate_);
 #else
 #ifdef USE_IMAGES
-        images_input_ = std::make_shared<ImagesInput>(ws_dir_path / (*config_file_ptr)["images_relative_path"].as<std::string>());
+        images_input_ = std::make_shared<ImagesInput>(
+            ws_dir_path / (*config_file_ptr)["images_relative_path"].as<std::string>(),
+            frame_rate_);
 #else
         // 初始化相机和检测器
         camera_ = std::make_shared<Camera>((*config_file_ptr)["cam_ip"].as<std::string>(), (*config_file_ptr)["pc_ip"].as<std::string>());
@@ -243,8 +247,8 @@ private:
         //     RCLCPP_INFO(this->get_logger(), "received data: yaw[%.2f] pitch[%.2f]", last_yaw_rad_delayed_, last_pitch_rad_delayed_);
         //     cv::Mat frame;
         //     pthread_mutex_lock(&g_mutex);
-        //     if (!g_image.empty()) {
-        //         frame = g_image.clone();
+        //     if (!g_frame_packet.image.empty()) {
+        //         frame = g_frame_packet.image.clone();
         //         image_used = true;
         //     }
         //     pthread_mutex_unlock(&g_mutex);
@@ -469,7 +473,8 @@ private:
     void drawResults(cv::Mat& image, 
                      const std::vector<Light>& lights,
                      const std::vector<Armor>& armors,
-                     const std::vector<ArmorResult>& classifyResults) {
+                     const std::vector<ArmorResult>& classifyResults,
+                     const PredictorResult& predictor_result) {
         // cv::Mat result = image.clone();
         cv::Mat& result = image;
 
@@ -557,9 +562,12 @@ private:
             cv::Point2f center = res.center;
             cv::circle(result, center, 3, cv::Scalar(0, 0, 255), -1);
 
-            std::string text = cv::format("N%d (%.2f)", 
-                                        res.number, 
-                                        res.confidence);
+            const double distance_m = res.solve_armor_result.distance / 1000.0;
+            std::string text = cv::format("N%d C%.2f T%d D%.2fm",
+                                          res.number,
+                                          res.confidence,
+                                          res.is_tracked_now ? 1 : 0,
+                                          distance_m);
             cv::Point text_pos(res.corners[1].x, res.corners[1].y - 10);
 
             // 使用黑色描边使文字更清晰
@@ -570,12 +578,28 @@ private:
                         cv::FONT_HERSHEY_SIMPLEX, 0.6, 
                         cv::Scalar(0, 0, 255), 1);
 
-            // 添加跟踪状态显示
-            std::string track_text = "TRACKING";
-            cv::Point track_pos(center.x - 30, center.y + 30);
-            cv::putText(result, track_text, track_pos,
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5,
-                        cv::Scalar(0, 255, 0), 1);
+            const TargetManagerStatus& target_status =
+                predictor_main_->targetManagerStatus();
+            const bool is_target_candidate =
+                target_status.target_type.has_value() &&
+                res.number == static_cast<int>(*target_status.target_type);
+            const bool is_measurement =
+                predictor_result.has_measurement &&
+                res.number == predictor_result.measurement_number &&
+                cv::norm(res.center - predictor_result.measurement_center) < 0.5;
+
+            if (is_target_candidate) {
+                cv::putText(result, "TARGET CANDIDATE",
+                            cv::Point(center.x - 45, center.y + 30),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                            cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+            }
+            if (is_measurement) {
+                cv::putText(result, "MEASUREMENT",
+                            cv::Point(center.x - 45, center.y + 52),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                            cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+            }
         }
 
 //         // 在窗口中显示图像
@@ -620,6 +644,8 @@ private:
 
         
         cv::Mat frame;
+        double frame_timestamp_s = 0.0;
+        [[maybe_unused]] std::uint64_t frame_id = 0;
 #if defined(USE_VIDEO) || defined(USE_IMAGES) || defined(SYNC_CAMERA_FPS)
         while (image_used)
         {
@@ -627,8 +653,10 @@ private:
         }
 #endif
         pthread_mutex_lock(&g_mutex);
-        if (!g_image.empty()) {
-            frame = g_image.clone();
+        if (!g_frame_packet.image.empty()) {
+            frame = g_frame_packet.image.clone();
+            frame_timestamp_s = g_frame_packet.timestamp_s;
+            frame_id = g_frame_packet.frame_id;
             image_used = true;
         }
         pthread_mutex_unlock(&g_mutex);
@@ -701,7 +729,10 @@ private:
                 recalibrateHeadIMU();
             }
             headIMUInfos.last_auto_aim_switch = auto_aim_switch;
-            PredictorResult predictor_result = predictor_main_ -> step(classifyResults_withSolveArmorResult, frame, 
+            PredictorResult predictor_result = predictor_main_ -> step(
+                                                                       classifyResults_withSolveArmorResult,
+                                                                       frame,
+                                                                       frame_timestamp_s,
                                                                        ArmorType::Nearest,
                                                                        auto_aim_switch, headIMUInfos.mcu_yaw_online); // Todo
             float mcu_command_pitch = predictor_result.command_pitch;
@@ -723,27 +754,32 @@ private:
             cv::putText(frame, 
                 cv::format("V: %.1f m/s, P: %.1f, Y: %.1f", 
                     bullet_velocity_, last_pitch_rad_delayed_, last_yaw_rad_delayed_),
-                cv::Point(20, 50),
+                cv::Point(20, 195),
                 cv::FONT_HERSHEY_COMPLEX, 0.7, 
                 cv::Scalar(0, 255, 0), 1, 8, false);
             cv::putText(frame, 
                 "enemy_color: " + enemy_color_, 
-                cv::Point2f(20,80), 
+                cv::Point2f(20,225),
                 cv::FONT_HERSHEY_COMPLEX, 0.7, 
                 cv::Scalar(0, 255, 0), 1, 8, false);
-            cv::putText(frame, 
-                "aiming "+ArmorType::ArmorTypeStrings[predictor_result.armor_type]+": "+
-                    (predictor_result.armor_type == ArmorType::Outpost ||
-                             predictor_result.armor_type == ArmorType::Base
-                         ? "DIRECT"
-                         : "EKF"),
-                cv::Point2f(20, 110), 
+            const TargetManagerStatus& target_status =
+                predictor_main_->targetManagerStatus();
+            const std::string aiming_text = target_status.target_type.has_value()
+                ? "aiming " + ArmorType::ArmorTypeStrings[*target_status.target_type] +
+                    ": " + ((*target_status.target_type == ArmorType::Outpost ||
+                              *target_status.target_type == ArmorType::Base)
+                                 ? "DIRECT"
+                                 : "EKF")
+                : "aiming NONE";
+            cv::putText(frame, aiming_text,
+                cv::Point2f(20, 255),
                 cv::FONT_HERSHEY_COMPLEX, 0.7, 
                 cv::Scalar(0, 255, 0), 1, 8, false);
 
             drawRestFrame(frame, rest_frame_, armor_solver_);
 
-            drawResults(frame, lights, armors, classifyResults_withSolveArmorResult);
+            drawResults(frame, lights, armors,
+                        classifyResults_withSolveArmorResult, predictor_result);
 
             yaw_visualizer_ -> update(last_yaw_rad_delayed_ + (headIMUInfos.use_head_imu ? headIMUInfos.to_mcu_delta_yaw : 0.0), mcu_command_yaw);
             // yaw_visualizer_ -> show();
@@ -754,12 +790,12 @@ private:
 
             cv::putText(frame, 
                 cv::format("frame rate: %.1f fps", fps_counter->fps()), 
-                cv::Point(20, 140),
+                cv::Point(20, 285),
                 cv::FONT_HERSHEY_COMPLEX, 0.7, 
                 cv::Scalar(0, 255, 0), 1, 8, false);
             cv::putText(frame, 
                 cv::format("since start: %.4f s", static_cast<float>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - node_start_time).count()) / 1000.0f), 
-                cv::Point(20, 170),
+                cv::Point(20, 315),
                 cv::FONT_HERSHEY_COMPLEX, 0.7, 
                 cv::Scalar(0, 255, 0), 1, 8, false);
             auto system_clock_now = std::chrono::system_clock::now();
@@ -769,7 +805,7 @@ private:
             std::strftime(system_clock_now_str_buffer, sizeof(system_clock_now_str_buffer), "%Y-%m-%d %H:%M:%S", system_clock_now_tm);
             cv::putText(frame, 
                 cv::format("system_clock: %s", system_clock_now_str_buffer), 
-                cv::Point(20, 200),
+                cv::Point(20, 345),
                 cv::FONT_HERSHEY_COMPLEX, 0.7, 
                 cv::Scalar(0, 255, 0), 1, 8, false);
 

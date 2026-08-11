@@ -8,7 +8,73 @@ void AllPredictor::update_serial_info(float bullet_velocity, float last_pitch_ra
     total_yaw_rad_delayed_ = total_yaw_rad_delayed;
 }
 
-PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv::Mat& frame)
+void AllPredictor::resetTarget()
+{
+    if (ekf_target_predictor_) {
+        const EKFTargetState ekf_state = ekf_target_predictor_->state();
+        if (ekf_state.update_frames > 90) {
+            init_r = (ekf_state.r1 + ekf_state.r2) / 2.0F;
+        }
+        if (!(init_r >= 200.0F)) init_r = 200.0F;
+        if (!(init_r <= 400.0F)) init_r = 400.0F;
+    }
+    ekf_target_predictor_.reset();
+    target_active_ = false;
+    has_valid_ballistic = false;
+    last_total_delay_ = 0.0F;
+    last_rest_frame_pos = cv::Point3f(0.0F, 0.0F, 0.0F);
+    last_aim_yaw_pitch_ = cv::Point2f(0.0F, 0.0F);
+    last_pixel_horizontal_center_distance = 1e10F;
+    latest_armor_distance = 1e10F;
+    armor_is_large = false;
+
+    ekf_fire_control_data.aim_center_schmitt_trigger = false;
+    ekf_fire_control_data.new_target = true;
+    ekf_fire_control_data.last_target_yaw = 0.0F;
+    ekf_fire_control_data.last_target_yaw_jump_time =
+        std::chrono::steady_clock::now();
+}
+
+void AllPredictor::startTarget()
+{
+    target_active_ = true;
+    latest_predicting_start_time = std::chrono::steady_clock::now();
+    ekf_fire_control_data.new_target = true;
+}
+
+bool AllPredictor::targetActive() const
+{
+    return target_active_;
+}
+
+std::optional<std::string> AllPredictor::ekfTrackerState() const
+{
+    if (armor_class == ArmorType::Base ||
+        armor_class == ArmorType::Outpost ||
+        !ekf_target_predictor_) {
+        return std::nullopt;
+    }
+    return ekf_target_predictor_->debugState().tracker_state;
+}
+
+ArmorResult* AllPredictor::selectCurrentMeasurement(
+    std::vector<ArmorResult>& candidates)
+{
+    ArmorResult* measurement = nullptr;
+    for (ArmorResult& candidate : candidates) {
+        if (measurement == nullptr ||
+            (candidate.is_tracked_now && !measurement->is_tracked_now) ||
+            (candidate.is_tracked_now == measurement->is_tracked_now &&
+             candidate.confidence > measurement->confidence)) {
+            measurement = &candidate;
+        }
+    }
+    return measurement;
+}
+
+PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
+                                   cv::Mat& frame,
+                                   double frame_timestamp_s)
 {
     PredictorResult result;
 
@@ -25,34 +91,25 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
     result.integrating = true;
 
 
+    ArmorResult* current_measurement =
+        selectCurrentMeasurement(classifyResults);
+    if (current_measurement != nullptr) {
+        result.has_measurement = true;
+        result.measurement_number = current_measurement->number;
+        result.measurement_center = current_measurement->center;
+    }
+
     const bool ekf_warmup_complete =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - latest_predicting_start_time)
             .count() >= pre_predict_time;
-    if (!classifyResults.empty()) {
-        // 选择最佳目标（置信度最高）
-        auto it = std::max_element(
-            classifyResults.begin(), classifyResults.end(),
-            [](const ArmorResult& a, const ArmorResult& b) {
-                if (a.is_tracked_now && !b.is_tracked_now) {
-                    return false;
-                }
-                if (!a.is_tracked_now && b.is_tracked_now) {
-                    return true;
-                }
-                return a.confidence < b.confidence;
-            }
-        );
-        if (it != classifyResults.end()) {
-            auto chosen_armor = *it;
+    if (current_measurement != nullptr) {
+            const ArmorResult& chosen_armor = *current_measurement;
             AimResult solve_armor_result = chosen_armor.solve_armor_result;
             armor_is_large = chosen_armor.is_large;
 
-            is_reset = true;
-            last_com_time = std::chrono::steady_clock::now();
-
             last_pixel_horizontal_center_distance = std::abs(chosen_armor.center.x - static_cast<float>(frame.cols)/2.0);
-            latest_armor_distance = std::sqrt(solve_armor_result.distance);
+            latest_armor_distance = solve_armor_result.distance;
             
             // 查看z轴距离轴数据
             oscilloscope_common_ -> addDataPoint(solve_armor_result.position.z / 10000, 0);
@@ -88,40 +145,17 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                 predicted_armor_pos = last_rest_frame_pos;
                 predicted_aim_pos = last_rest_frame_pos;
             }
-        }
     } else {
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - last_com_time).count() >= reset_predictor_time) {
-            if (ekf_target_predictor_) {
-                EKFTargetState ekf_state = ekf_target_predictor_->state();
-                if (ekf_state.update_frames > 90) {
-                    init_r = (ekf_state.r1 + ekf_state.r2) / 2.0;
-                }
-                if (!(init_r >= 200.0)) init_r = 200.0; // 限位，同时防止nan传播
-                if (!(init_r <= 400.0)) init_r = 400.0;
-                ekf_target_predictor_.reset();
-            }
-            is_reset = true;
-            last_pixel_horizontal_center_distance = 1e10;
-            has_valid_ballistic = false;
-            ekf_fire_control_data.new_target = true;
-            latest_armor_distance = 1e10;
-
-            result.reset = true;
-            result.command_delta_pitch = 0.0;
-            result.command_delta_yaw = 0.0;
-            result.fire_flag = false;
-            result.armor_type = armor_class;
-            result.pixel_horizontal_center_distance = last_pixel_horizontal_center_distance;
-            result.latest_armor_distance = latest_armor_distance;
-            return result;
-        } else {
-            result.reset = false;
-            result.command_delta_pitch = 0.0;
-            result.command_delta_yaw = 0.0;
-            result.fire_flag = false;
-            predicted_armor_pos = last_rest_frame_pos;
-            predicted_aim_pos = last_rest_frame_pos;
-        }
+        // TargetManager owns the target lifetime. During TEMP_LOST an empty
+        // candidate list must keep this predictor alive so the EKF can execute
+        // missUpdate() below; resetTarget() is called only on a state transition
+        // to LOST.
+        result.reset = false;
+        result.command_delta_pitch = 0.0;
+        result.command_delta_yaw = 0.0;
+        result.fire_flag = false;
+        predicted_armor_pos = last_rest_frame_pos;
+        predicted_aim_pos = last_rest_frame_pos;
     }
 
 
@@ -132,16 +166,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
     // intentionally keep direct current-observation aiming in this refactor.
     if (armor_class != ArmorType::Base && armor_class != ArmorType::Outpost) {
         // ========================== Robust EKF ===========================
-#ifdef USE_VIDEO
-        // Standalone replay advances using the recorded/source frame time.
-        // Using steady_clock here makes the EKF depend on OpenVINO/PnP runtime,
-        // so the same video produces a different dt and therefore different w/NIS.
-        const double RMM_update_time = robust_video_time_s_;
-        robust_video_time_s_ += robust_video_dt_s_;
-#else
-        const double RMM_update_time =
-            (std::chrono::steady_clock::now() - node_start_time).count() / 1e9;
-#endif
+        const double RMM_update_time = frame_timestamp_s;
         bool RMM_updated_flag = false;
         // Scratch canvas is rebuilt below as the pure Robust-EKF top view.
         cv::Mat RMM_visualize_frame = cv::Mat::zeros(800, 800, CV_8UC3);
@@ -155,24 +180,10 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
         bool ekf_has_aim = false;
         cv::Point3f ekf_aim_world(0.0f, 0.0f, 0.0f);
 
-        // Keep exactly the same per-frame selection contract as pose logger v2:
-        // 1) tracked observation wins over untracked candidates;
-        // 2) within the same tracking status choose the highest confidence;
-        // 3) if no candidate is marked tracked, still use the best real PnP candidate.
-        // The old integration incorrectly turned case (3) into TEMP_LOST, so online
-        // input differed from the standalone world_timed replay of the same video.
-        ArmorResult* rmm_measurement = nullptr;
-        for (auto& candidate : classifyResults) {
-            if (rmm_measurement == nullptr ||
-                (candidate.is_tracked_now && !rmm_measurement->is_tracked_now) ||
-                (candidate.is_tracked_now == rmm_measurement->is_tracked_now &&
-                 candidate.confidence > rmm_measurement->confidence)) {
-                rmm_measurement = &candidate;
-            }
-        }
-
-        if (rmm_measurement != nullptr) {
-            AimResult solve_armor_result = rmm_measurement->solve_armor_result;
+        // Direct observation and EKF update deliberately share the one
+        // tracked-first/confidence-second measurement selected above.
+        if (current_measurement != nullptr) {
+            AimResult solve_armor_result = current_measurement->solve_armor_result;
             cv::Point3f rest_frame_pos =
                 rest_frame_->pnpToWorldP3f(solve_armor_result.position);
             std::vector<float> rest_frame_euler_angles =
@@ -289,7 +300,8 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                 cv::FONT_HERSHEY_COMPLEX, 0.7, 
                 cv::Scalar(0, 255, 0), 1, 8, false);
             cv::putText(RMM_visualize_frame, 
-                "T:"+std::to_string(RMM_update_time), 
+                cv::format("T:%.3f  dt:%.1f ms", RMM_update_time,
+                           RMM_debug.dt_s * 1000.0),
                 cv::Point2f(20,110), 
                 cv::FONT_HERSHEY_COMPLEX, 0.7, 
                 cv::Scalar(0, 255, 0), 1, 8, false);
@@ -566,11 +578,19 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults, cv
                                 cv::Scalar(0, 0, 200), 1, cv::LINE_AA);
                 }
 
+                std::string ekf_title = cv::format(
+                    "REAL PROJECT EKF  t=%.3fs  dt=%.1fms",
+                    RMM_update_time, RMM_debug.dt_s * 1000.0);
+                if (RMM_debug.time_discontinuity) {
+                    ekf_title += "  TIME RESET";
+                }
                 cv::putText(
-                    RMM_visualize_frame,
-                    cv::format("REAL PROJECT EKF  t=%.3fs", RMM_update_time),
+                    RMM_visualize_frame, ekf_title,
                     cv::Point(14, 24), cv::FONT_HERSHEY_SIMPLEX, 0.56,
-                    cv::Scalar(30, 30, 30), 1, cv::LINE_AA);
+                    RMM_debug.time_discontinuity
+                        ? cv::Scalar(0, 0, 220)
+                        : cv::Scalar(30, 30, 30),
+                    1, cv::LINE_AA);
 
                 cv::putText(
                     RMM_visualize_frame,

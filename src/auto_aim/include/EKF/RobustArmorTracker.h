@@ -54,15 +54,15 @@ struct ArmorObservation {
 };
 
 struct RobustTrackerConfig {
-    // Same defaults as the validated v4 replay project.
-    double q_pos = 1e-4;
-    double q_vel = 1e-2;
-    double q_z = 1e-4;
-    double q_vz = 1e-2;
-    double q_yaw = 1e-4;
-    double q_w = 5e-3;
-    double q_radius = 1e-6;
-    double q_h = 1e-6;
+    // Continuous-time process noise. ArmorEKF discretizes these values using dt.
+    double sigma_acc_xy = 3.0;
+    double sigma_acc_z = 3.0;
+    double sigma_angular_acc = 2.12132;
+    double sigma_pos_rw_xy = 0.054006;
+    double sigma_pos_rw_z = 0.054006;
+    double sigma_yaw_rw = 0.054391;
+    double sigma_radius_rw = 0.005477;
+    double sigma_height_rw = 0.005477;
 
     double r_pos = 2e-3;
     double r_z = 2e-3;
@@ -144,8 +144,16 @@ private:
     bool initialized_ = false;
     Eigen::Matrix<double, 11, 1> X_ = Eigen::Matrix<double, 11, 1>::Zero();
     Eigen::Matrix<double, 11, 11> P_ = Eigen::Matrix<double, 11, 11>::Identity();
-    Eigen::Matrix<double, 11, 11> Q_ = Eigen::Matrix<double, 11, 11>::Identity();
     Eigen::Matrix<double, 4, 4> R_ = Eigen::Matrix<double, 4, 4>::Identity();
+
+    double sigma_acc_xy_ = 3.0;
+    double sigma_acc_z_ = 3.0;
+    double sigma_angular_acc_ = 2.12132;
+    double sigma_pos_rw_xy_ = 0.054006;
+    double sigma_pos_rw_z_ = 0.054006;
+    double sigma_yaw_rw_ = 0.054391;
+    double sigma_radius_rw_ = 0.005477;
+    double sigma_height_rw_ = 0.005477;
 
     double min_radius_ = 0.08;
     double max_radius_ = 0.60;

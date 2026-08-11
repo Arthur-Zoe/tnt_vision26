@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -54,6 +55,8 @@ struct EKFTargetState {
 };
 
 struct EKFTargetDebugState {
+    double dt_s = 0.0;
+    bool time_discontinuity = false;
     std::string tracker_state = "LOST";
     int matched_id = -1;
     bool measurement_valid = false;
@@ -94,10 +97,19 @@ public:
 private:
     static rm_ekf::ArmorObservation toMeters(
         const EKFTargetObservation& observation);
+    void resetTracker();
+    void initializeFromObservation(const EKFTargetObservation& observation);
+    void warnTimeIssue(const char* reason, double update_time, double dt);
 
     std::unique_ptr<rm_ekf::RobustArmorTracker> tracker_;
+    rm_ekf::RobustTrackerConfig config_;
     rm_ekf::TrackerResult last_result_;
     double last_update_time_ = 0.0;
+    double last_dt_s_ = 0.0;
+    double max_tracking_gap_s_ = std::numeric_limits<double>::infinity();
     unsigned long long update_frames_ = 0;
     int debug_flip_flag_ = 1;
+    bool has_update_time_ = false;
+    bool timestamp_warning_active_ = false;
+    bool time_discontinuity_ = false;
 };

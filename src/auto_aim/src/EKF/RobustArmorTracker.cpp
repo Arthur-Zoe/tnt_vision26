@@ -53,14 +53,15 @@ RobustTrackerConfig RobustTrackerConfig::fromYaml(const YAML::Node& root, double
     readIfExists(n, "initial_r2", cfg.initial_filter.r2);
     readIfExists(n, "initial_h", cfg.initial_filter.h);
 
-    readIfExists(n, "q_pos", cfg.q_pos);
-    readIfExists(n, "q_vel", cfg.q_vel);
-    readIfExists(n, "q_z", cfg.q_z);
-    readIfExists(n, "q_vz", cfg.q_vz);
-    readIfExists(n, "q_yaw", cfg.q_yaw);
-    readIfExists(n, "q_w", cfg.q_w);
-    readIfExists(n, "q_radius", cfg.q_radius);
-    readIfExists(n, "q_h", cfg.q_h);
+    const YAML::Node process_noise = n["process_noise"];
+    readIfExists(process_noise, "sigma_acc_xy", cfg.sigma_acc_xy);
+    readIfExists(process_noise, "sigma_acc_z", cfg.sigma_acc_z);
+    readIfExists(process_noise, "sigma_angular_acc", cfg.sigma_angular_acc);
+    readIfExists(process_noise, "sigma_pos_rw_xy", cfg.sigma_pos_rw_xy);
+    readIfExists(process_noise, "sigma_pos_rw_z", cfg.sigma_pos_rw_z);
+    readIfExists(process_noise, "sigma_yaw_rw", cfg.sigma_yaw_rw);
+    readIfExists(process_noise, "sigma_radius_rw", cfg.sigma_radius_rw);
+    readIfExists(process_noise, "sigma_height_rw", cfg.sigma_height_rw);
 
     readIfExists(n, "r_pos", cfg.r_pos);
     readIfExists(n, "r_z", cfg.r_z);
@@ -175,13 +176,14 @@ Eigen::Matrix<double, 4, 11> ArmorModel::measurementJacobian(
 }
 
 void ArmorEKF::configure(const RobustTrackerConfig& cfg) {
-    Q_.setZero();
-    Q_(0, 0) = cfg.q_pos;     Q_(1, 1) = cfg.q_vel;
-    Q_(2, 2) = cfg.q_pos;     Q_(3, 3) = cfg.q_vel;
-    Q_(4, 4) = cfg.q_z;       Q_(5, 5) = cfg.q_vz;
-    Q_(6, 6) = cfg.q_yaw;     Q_(7, 7) = cfg.q_w;
-    Q_(8, 8) = cfg.q_radius;  Q_(9, 9) = cfg.q_radius;
-    Q_(10, 10) = cfg.q_h;
+    sigma_acc_xy_ = cfg.sigma_acc_xy;
+    sigma_acc_z_ = cfg.sigma_acc_z;
+    sigma_angular_acc_ = cfg.sigma_angular_acc;
+    sigma_pos_rw_xy_ = cfg.sigma_pos_rw_xy;
+    sigma_pos_rw_z_ = cfg.sigma_pos_rw_z;
+    sigma_yaw_rw_ = cfg.sigma_yaw_rw;
+    sigma_radius_rw_ = cfg.sigma_radius_rw;
+    sigma_height_rw_ = cfg.sigma_height_rw;
 
     R_.setZero();
     R_(0, 0) = cfg.r_pos;
@@ -231,9 +233,35 @@ void ArmorEKF::predict(double dt) {
     F(4, 5) = dt;
     F(6, 7) = dt;
 
+    const double dt2 = dt * dt;
+    const double dt3 = dt2 * dt;
+    const double dt4 = dt2 * dt2;
+    Eigen::Matrix<double, 11, 11> Q =
+        Eigen::Matrix<double, 11, 11>::Zero();
+    const auto set_acceleration_pair =
+        [&Q, dt2, dt3, dt4](int position_index, int velocity_index,
+                            double sigma) {
+            const double sigma2 = sigma * sigma;
+            Q(position_index, position_index) = 0.25 * dt4 * sigma2;
+            Q(position_index, velocity_index) = 0.5 * dt3 * sigma2;
+            Q(velocity_index, position_index) = 0.5 * dt3 * sigma2;
+            Q(velocity_index, velocity_index) = dt2 * sigma2;
+        };
+    set_acceleration_pair(0, 1, sigma_acc_xy_);
+    set_acceleration_pair(2, 3, sigma_acc_xy_);
+    set_acceleration_pair(4, 5, sigma_acc_z_);
+    set_acceleration_pair(6, 7, sigma_angular_acc_);
+    Q(0, 0) += sigma_pos_rw_xy_ * sigma_pos_rw_xy_ * dt;
+    Q(2, 2) += sigma_pos_rw_xy_ * sigma_pos_rw_xy_ * dt;
+    Q(4, 4) += sigma_pos_rw_z_ * sigma_pos_rw_z_ * dt;
+    Q(6, 6) += sigma_yaw_rw_ * sigma_yaw_rw_ * dt;
+    Q(8, 8) = sigma_radius_rw_ * sigma_radius_rw_ * dt;
+    Q(9, 9) = sigma_radius_rw_ * sigma_radius_rw_ * dt;
+    Q(10, 10) = sigma_height_rw_ * sigma_height_rw_ * dt;
+
     X_ = F * X_;
     enforcePhysicalLimits();
-    P_ = F * P_ * F.transpose() + Q_;
+    P_ = F * P_ * F.transpose() + Q;
     P_ = 0.5 * (P_ + P_.transpose());
 }
 

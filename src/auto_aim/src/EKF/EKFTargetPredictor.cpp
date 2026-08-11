@@ -1,5 +1,7 @@
 #include "EKF/EKFTargetPredictor.h"
 
+#include <cmath>
+#include <iostream>
 #include <optional>
 
 namespace {
@@ -9,43 +11,113 @@ constexpr double kMillimetersPerMeter = 1000.0;
 EKFTargetPredictor::EKFTargetPredictor(
     const EKFTargetObservation& initial_observation,
     double initial_radius_mm,
-    std::shared_ptr<YAML::Node> config_file_ptr)
-    : tracker_(std::make_unique<rm_ekf::RobustArmorTracker>()),
-      last_update_time_(initial_observation.t) {
-    rm_ekf::RobustTrackerConfig config;
+    std::shared_ptr<YAML::Node> config_file_ptr) {
     if (config_file_ptr) {
-        config = rm_ekf::RobustTrackerConfig::fromYaml(
+        config_ = rm_ekf::RobustTrackerConfig::fromYaml(
             *config_file_ptr, initial_radius_mm / kMillimetersPerMeter);
+        const YAML::Node reset_time_node = (*config_file_ptr)["reset_predictor_time"];
+        if (reset_time_node) {
+            const double reset_time_ms = reset_time_node.as<double>();
+            if (std::isfinite(reset_time_ms) && reset_time_ms > 0.0) {
+                max_tracking_gap_s_ = reset_time_ms / 1000.0;
+            }
+        }
     } else {
-        config.initial_filter.r1 = initial_radius_mm / kMillimetersPerMeter;
-        config.initial_filter.r2 = initial_radius_mm / kMillimetersPerMeter;
-        config.initial_filter.h = 0.0;
+        config_.initial_filter.r1 = initial_radius_mm / kMillimetersPerMeter;
+        config_.initial_filter.r2 = initial_radius_mm / kMillimetersPerMeter;
+        config_.initial_filter.h = 0.0;
     }
-    tracker_->configure(config);
 
-    last_result_ = tracker_->process(toMeters(initial_observation), 0.0, -1);
-    update_frames_ = 1;
-    if (tracker_->currentArmorId() >= 0) {
-        debug_flip_flag_ = (tracker_->currentArmorId() % 2) + 1;
+    if (std::isfinite(initial_observation.t)) {
+        initializeFromObservation(initial_observation);
+    } else {
+        resetTracker();
+        last_dt_s_ = initial_observation.t;
+        warnTimeIssue("non-finite timestamp", initial_observation.t,
+                      initial_observation.t);
     }
 }
 
 void EKFTargetPredictor::update(const EKFTargetObservation& observation) {
+    time_discontinuity_ = false;
+    if (!std::isfinite(observation.t)) {
+        last_dt_s_ = observation.t;
+        warnTimeIssue("non-finite timestamp", observation.t, observation.t);
+        return;
+    }
+
+    if (!has_update_time_) {
+        initializeFromObservation(observation);
+        timestamp_warning_active_ = false;
+        return;
+    }
+
     const double dt = observation.t - last_update_time_;
+    last_dt_s_ = dt;
+    if (!std::isfinite(dt)) {
+        warnTimeIssue("non-finite dt", observation.t, dt);
+        return;
+    }
+    if (dt <= 0.0) {
+        warnTimeIssue("duplicate/out-of-order timestamp", observation.t, dt);
+        return;
+    }
+    if (dt > max_tracking_gap_s_) {
+        warnTimeIssue("tracking time discontinuity", observation.t, dt);
+        time_discontinuity_ = true;
+        initializeFromObservation(observation);
+        return;
+    }
+
     last_result_ = tracker_->process(toMeters(observation), dt, -1);
+    last_update_time_ = observation.t;
+    timestamp_warning_active_ = false;
     if (last_result_.updated || last_result_.initialized_this_frame) {
         ++update_frames_;
     }
-    last_update_time_ = observation.t;
     if (tracker_->currentArmorId() >= 0) {
         debug_flip_flag_ = (tracker_->currentArmorId() % 2) + 1;
     }
 }
 
 void EKFTargetPredictor::missUpdate(double update_time) {
+    time_discontinuity_ = false;
+    if (!std::isfinite(update_time)) {
+        last_dt_s_ = update_time;
+        warnTimeIssue("non-finite timestamp", update_time, update_time);
+        return;
+    }
+
+    if (!has_update_time_) {
+        last_update_time_ = update_time;
+        last_dt_s_ = 0.0;
+        has_update_time_ = true;
+        timestamp_warning_active_ = false;
+        return;
+    }
+
     const double dt = update_time - last_update_time_;
+    last_dt_s_ = dt;
+    if (!std::isfinite(dt)) {
+        warnTimeIssue("non-finite dt", update_time, dt);
+        return;
+    }
+    if (dt <= 0.0) {
+        warnTimeIssue("duplicate/out-of-order timestamp", update_time, dt);
+        return;
+    }
+    if (dt > max_tracking_gap_s_) {
+        warnTimeIssue("tracking time discontinuity", update_time, dt);
+        resetTracker();
+        last_update_time_ = update_time;
+        has_update_time_ = true;
+        time_discontinuity_ = true;
+        return;
+    }
+
     last_result_ = tracker_->process(std::nullopt, dt, -1);
     last_update_time_ = update_time;
+    timestamp_warning_active_ = false;
     if (tracker_->currentArmorId() >= 0) {
         debug_flip_flag_ = (tracker_->currentArmorId() % 2) + 1;
     }
@@ -109,6 +181,8 @@ EKFTargetState EKFTargetPredictor::state() const {
 
 EKFTargetDebugState EKFTargetPredictor::debugState() const {
     EKFTargetDebugState debug;
+    debug.dt_s = last_dt_s_;
+    debug.time_discontinuity = time_discontinuity_;
     debug.tracker_state = rm_ekf::trackerStateName(last_result_.state);
     debug.matched_id = last_result_.matched_id;
     debug.measurement_valid = last_result_.measurement_valid;
@@ -135,6 +209,38 @@ bool EKFTargetPredictor::ready() const {
 
 bool EKFTargetPredictor::hasState() const {
     return tracker_->hasState();
+}
+
+void EKFTargetPredictor::warnTimeIssue(const char* reason,
+                                       double update_time,
+                                       double dt) {
+    if (!timestamp_warning_active_) {
+        std::cerr << "[EKFTargetPredictor] warning: " << reason
+                  << "; t=" << update_time << " dt=" << dt
+                  << " s, max_tracking_gap=" << max_tracking_gap_s_ << " s"
+                  << std::endl;
+        timestamp_warning_active_ = true;
+    }
+}
+
+void EKFTargetPredictor::resetTracker() {
+    tracker_ = std::make_unique<rm_ekf::RobustArmorTracker>();
+    tracker_->configure(config_);
+    last_result_ = rm_ekf::TrackerResult{};
+    update_frames_ = 0;
+    debug_flip_flag_ = 1;
+}
+
+void EKFTargetPredictor::initializeFromObservation(
+    const EKFTargetObservation& observation) {
+    resetTracker();
+    last_result_ = tracker_->process(toMeters(observation), 0.0, -1);
+    last_update_time_ = observation.t;
+    has_update_time_ = true;
+    update_frames_ = 1;
+    if (tracker_->currentArmorId() >= 0) {
+        debug_flip_flag_ = (tracker_->currentArmorId() % 2) + 1;
+    }
 }
 
 rm_ekf::ArmorObservation EKFTargetPredictor::toMeters(

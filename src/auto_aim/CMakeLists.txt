@@ -69,6 +69,7 @@ add_library(armor_detector SHARED
     src/EKF/RobustArmorTracker.cpp
     src/EKF/EKFTargetPredictor.cpp
     src/predictor/AllPredictor.cpp
+    src/predictor/TargetManager.cpp
     src/predictor/PredictorMain.cpp
     src/visualizer/DataVisualizer.cpp
     src/visualizer/RestFrameDraw.cpp

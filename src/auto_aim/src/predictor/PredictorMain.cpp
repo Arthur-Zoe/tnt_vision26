@@ -13,66 +13,61 @@ void PredictorMain::update_serial_info(float bullet_velocity, float last_pitch_r
 
 PredictorResult PredictorMain::step(std::vector<ArmorResult>& classifyResults,
                                     cv::Mat& frame,
+                                    double frame_timestamp_s,
                                     ArmorType::ArmorType priority_armor,
                                     bool auto_aim_switch,
                                     bool mcu_yaw_online) {
 
     PredictorResult chosen_result;
 
-    std::vector<std::vector<ArmorResult>> classified_classifyResults(classify_classes);
-    for (ArmorResult& classify_result : classifyResults) {
-        classified_classifyResults[classify_result.number].push_back(classify_result);
-    }
-    // todo 前哨站/基地特殊处理
-    std::vector<PredictorResult> classified_predictor_results;
-    for (size_t all_predictors_index = 0; all_predictors_index < classify_classes; all_predictors_index++) {
-        if (classified_classifyResults[all_predictors_index].size() != 0) {
-            if (all_predictors_[all_predictors_index] -> is_reset == true) {
-                all_predictors_[all_predictors_index] -> latest_predicting_start_time = std::chrono::steady_clock::now();
-                all_predictors_[all_predictors_index] -> is_reset = false;
-            }
-        }
-        if (all_predictors_[all_predictors_index] -> is_reset == false) {
-            classified_predictor_results.push_back(
-                all_predictors_[all_predictors_index] -> step(
-                    classified_classifyResults[all_predictors_index], frame)
-            );
-            // RCLCPP_INFO(node->get_logger(), "%ld updating", all_predictors_index);
+    TargetManagerUpdate target_update = target_manager_->update(
+        classifyResults, frame.size(), frame_timestamp_s, priority_armor);
+
+    if (target_update.released_target.has_value()) {
+        const auto index =
+            static_cast<std::size_t>(*target_update.released_target);
+        if (index < all_predictors_.size() && all_predictors_[index]) {
+            all_predictors_[index]->resetTarget();
         }
     }
 
-    if (priority_armor == ArmorType::Middle) {
-        if (!classified_predictor_results.empty()) {
-            auto it = std::min_element(
-                classified_predictor_results.begin(), classified_predictor_results.end(),
-                [](const PredictorResult& a, const PredictorResult& b) {
-                    return a.pixel_horizontal_center_distance < b.pixel_horizontal_center_distance;
-                }
-            );
-            if (it != classified_predictor_results.end()) {
-                auto middle_result = *it;
-                chosen_result = middle_result;
-            }
+    if (target_update.start_target.has_value()) {
+        const auto index = static_cast<std::size_t>(*target_update.start_target);
+        if (index < all_predictors_.size() && all_predictors_[index]) {
+            all_predictors_[index]->resetTarget();
+            all_predictors_[index]->startTarget();
         }
-    } else if (priority_armor == ArmorType::Nearest) {
-        if (!classified_predictor_results.empty()) {
-            auto it = std::min_element(
-                classified_predictor_results.begin(), classified_predictor_results.end(),
-                [](const PredictorResult& a, const PredictorResult& b) {
-                    return a.latest_armor_distance < b.latest_armor_distance;
-                }
-            );
-            if (it != classified_predictor_results.end()) {
-                auto nearest_result = *it;
-                chosen_result = nearest_result;
+    }
+
+    const TargetManagerStatus& target_status = target_manager_->status();
+    if (target_update.process_current_frame &&
+        target_status.target_type.has_value()) {
+        const auto active_index =
+            static_cast<std::size_t>(*target_status.target_type);
+        if (active_index < all_predictors_.size() &&
+            all_predictors_[active_index]) {
+            // This is the only predictor advanced this frame. Other detected
+            // vehicles remain available for drawing but cannot update or
+            // compete with the persistent target.
+            if (!all_predictors_[active_index]->targetActive()) {
+                all_predictors_[active_index]->resetTarget();
+                all_predictors_[active_index]->startTarget();
             }
+            chosen_result = all_predictors_[active_index]->step(
+                target_update.target_candidates, frame, frame_timestamp_s);
         }
-    } else {
-        for (PredictorResult predictor_result : classified_predictor_results) {
-            if (predictor_result.armor_type == priority_armor && !predictor_result.reset) {
-                chosen_result = predictor_result;
-            }
-        }
+    }
+
+    // Target lifecycle is the final fire-control authority. DETECTING may
+    // initialize and update the predictor, and TEMP_LOST may execute pure
+    // prediction, but only a valid, continuous TRACKING frame may fire or
+    // accumulate PI.
+    const bool allow_tracking_output =
+        target_update.process_current_frame &&
+        TargetManager::allowsFireControl(target_status.state);
+    if (!allow_tracking_output) {
+        chosen_result.fire_flag = false;
+        chosen_result.integrating = false;
     }
 
     if (auto_aim_switch) { // 仅在电控自瞄开关打开时进行积分
@@ -130,9 +125,25 @@ PredictorResult PredictorMain::step(std::vector<ArmorResult>& classifyResults,
         cv::Scalar(0, 255, 0), 1, 8, false);
 
 
+    std::optional<std::string> ekf_state;
+    if (target_status.target_type.has_value()) {
+        const auto active_index =
+            static_cast<std::size_t>(*target_status.target_type);
+        if (active_index < all_predictors_.size() &&
+            all_predictors_[active_index]) {
+            ekf_state = all_predictors_[active_index]->ekfTrackerState();
+        }
+    }
+    target_manager_->drawOverlay(frame, ekf_state);
+
     return chosen_result;
 }
 
 void PredictorMain::reset_yaw_integration() {
     yaw_integration = 0.0;
+}
+
+const TargetManagerStatus& PredictorMain::targetManagerStatus() const
+{
+    return target_manager_->status();
 }

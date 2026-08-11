@@ -5,6 +5,8 @@
 #include <chrono>
 #include <vector>
 #include <memory>
+#include <optional>
+#include <string>
 #define _USE_MATH_DEFINES
 #include <cmath>
 #include <algorithm>
@@ -30,6 +32,9 @@ struct PredictorResult {
     float pixel_horizontal_center_distance = 1e10;
     float latest_armor_distance = 1e10;
     bool integrating = false;
+    bool has_measurement = false;
+    int measurement_number = -1;
+    cv::Point2f measurement_center;
 
     struct {
         cv::Mat RMM_visualize_frame;   // robust-EKF top view (legacy name kept for logger compatibility)
@@ -68,10 +73,6 @@ public:
         yaw_rad_to_x_pixel_ratio = camera_matrix_Node[0][0].as<float>(); 
         pitch_rad_to_y_pixel_ratio = camera_matrix_Node[1][1].as<float>(); 
 
-        reset_predictor_time = (*config_file_ptr)["reset_predictor_time"].as<float>(); 
-
-        last_com_time = std::chrono::steady_clock::now();
-
         oscilloscope_common_ = std::make_shared<Oscilloscope>(640, 480, "Common Debug Oscilloscope "+std::to_string(armor_class), 2);
         oscilloscope_common_ -> setScale(2.0);
         oscilloscope_common_ -> setOffset(-1.0);
@@ -91,19 +92,16 @@ public:
         choose_armor_yaw_bias = M_PI / 180.0 * (*config_file_ptr)["choose_armor_yaw_bias_degree"].as<float>();
         RMM_visualize_zoom_out_factor = (*config_file_ptr)["RMM_visualize_zoom_out_factor"].as<float>();
 
-        // In USE_VIDEO mode advance the tracker with source-frame time, not
-        // detector/inference wall time. This preserves replay parity.
-        const double configured_fps = std::max(
-            1.0, static_cast<double>((*config_file_ptr)["frame_rate"].as<float>()));
-        robust_video_dt_s_ = 1.0 / configured_fps;
     }
 
-    PredictorResult step(std::vector<ArmorResult>& classifyResults, cv::Mat& frame);
+    PredictorResult step(std::vector<ArmorResult>& classifyResults, cv::Mat& frame,
+                         double frame_timestamp_s);
     void update_serial_info(float bullet_velocity, float last_pitch_rad_delayed, float last_yaw_rad_delayed, float total_yaw_rad_delayed);
-
-    bool is_reset = false;
-
-    std::chrono::steady_clock::time_point latest_predicting_start_time;
+    void resetTarget();
+    void startTarget();
+    bool targetActive() const;
+    std::optional<std::string> ekfTrackerState() const;
+    ArmorResult* selectCurrentMeasurement(std::vector<ArmorResult>& candidates);
 private:
     ArmorType::ArmorType armor_class;
     bool armor_is_large;
@@ -117,6 +115,8 @@ private:
     std::shared_ptr<FrameRateCounter> fps_counter;
 
     float last_total_delay_ = 0.0;
+    bool target_active_ = false;
+    std::chrono::steady_clock::time_point latest_predicting_start_time;
 
     std::shared_ptr<Oscilloscope> oscilloscope_common_;
 
@@ -129,8 +129,6 @@ private:
 
     float yaw_rad_to_x_pixel_ratio;
     float pitch_rad_to_y_pixel_ratio;
-    float reset_predictor_time;
-    std::chrono::steady_clock::time_point last_com_time;
     cv::Point2f last_aim_yaw_pitch_;
 
     cv::Point3f last_rest_frame_pos = {0.0, 0.0, 0.0};
@@ -169,8 +167,4 @@ private:
 
     float RMM_visualize_zoom_out_factor;
 
-    // Synthetic monotonic source time used only for offline video playback.
-    // Each AllPredictor advances exactly once per processed video frame while active.
-    double robust_video_time_s_ = 0.0;
-    double robust_video_dt_s_ = 1.0 / 30.0;
 };

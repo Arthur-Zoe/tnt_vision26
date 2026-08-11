@@ -26,10 +26,18 @@ images_relative_path : "InputImages"                    # 使用图片输入时�
 
 RMM_visualize_zoom_out_factor : 10.0 # 平面可视化缩放系数，该值越大视野范围越大
 
+# Persistent vehicle target lifecycle. Acquisition policies (Nearest/Middle or
+# a concrete armor class) are evaluated only while this state machine is LOST.
+target_manager:
+  min_detect_frames: 3
+  max_temp_lost_frames: 15
+  outpost_max_temp_lost_frames: 30
+  enable_priority_switch: false
+
 
 # Robust 11D EKF for normal four-armor vehicles.
 # Internal EKF units are meter / second / radian.
-# These defaults are copied from the v4 replay configuration that passed the recorded direction-reversal test.
+# Robust EKF configuration. Measurement/association/state-machine values below are unchanged.
 robust_ekf:
   # Initialization used by the standalone v4 replay that passed the recorded-data test.
   # These are meters. For a different physical robot, replace them with its measured geometry.
@@ -37,14 +45,18 @@ robust_ekf:
   initial_r2: 0.31
   initial_h: 0.09
 
-  q_pos: 0.0001
-  q_vel: 0.0100
-  q_z: 0.0001
-  q_vz: 0.0100
-  q_yaw: 0.0001
-  q_w: 0.0050
-  q_radius: 0.000001
-  q_h: 0.000001
+  # Continuous-time process-noise standard deviations. At 30 FPS the
+  # acceleration terms preserve the old velocity noise, while position/yaw
+  # random walks restore the old position/yaw diagonal noise.
+  process_noise:
+    sigma_acc_xy: 3.0           # m/s^2
+    sigma_acc_z: 3.0            # m/s^2
+    sigma_angular_acc: 2.12132  # rad/s^2
+    sigma_pos_rw_xy: 0.054006   # m/sqrt(s)
+    sigma_pos_rw_z: 0.054006    # m/sqrt(s)
+    sigma_yaw_rw: 0.054391      # rad/sqrt(s)
+    sigma_radius_rw: 0.005477   # m/sqrt(s)
+    sigma_height_rw: 0.005477   # m/sqrt(s)
 
   # Measurement covariance terms (variance, not standard deviation).
   r_pos: 0.002
@@ -173,4 +185,3 @@ MIN_TRACKING_COUNT : 2     # 最小连续跟踪次数           // 2
 IS_NEAR_MAX_DIST_RATIO : 1.5     # 50.0
 armor_tracker_fit_step : 5
 armor_tracker_predict_step : 5
-
