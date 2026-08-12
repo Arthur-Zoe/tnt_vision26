@@ -16,6 +16,81 @@ static inline std::string __src_dir__() {
 }
 
 namespace {
+double wrapToPi(double angle) {
+  return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+// OpenCV camera/object axes (x right, y down, z forward/plane normal) to the
+// project's NormalFrame axes (x right, y forward, z up). det(A)=+1.
+const Eigen::Matrix3d kCvToNormal =
+    (Eigen::Matrix3d() << 1.0, 0.0, 0.0,
+                          0.0, 0.0, 1.0,
+                          0.0, -1.0, 0.0).finished();
+
+Eigen::Matrix3d normalRotationFromYpr(double yaw, double pitch, double roll) {
+  const double cy = std::cos(yaw), sy = std::sin(yaw);
+  const double cp = std::cos(pitch), sp = std::sin(pitch);
+  const double cr = std::cos(roll), sr = std::sin(roll);
+
+  Eigen::Matrix3d R;
+  R << cy * cr - sy * sp * sr, -sy * cp, cy * sr + sy * sp * cr,
+       sy * cr + cy * sp * sr,  cy * cp, sy * sr - cy * sp * cr,
+       -cp * sr,                 sp,      cp * cr;
+  return R;
+}
+
+bool normalYprFromRotation(const Eigen::Matrix3d& R,
+                           double& yaw,
+                           double& pitch,
+                           double& roll) {
+  if (!R.allFinite()) return false;
+  pitch = std::asin(std::clamp(R(2, 1), -1.0, 1.0));
+  if (std::abs(std::cos(pitch)) <= 1e-6) {
+    roll = 0.0;
+    yaw = std::atan2(R(1, 0), R(0, 0));
+    return false;
+  }
+  yaw = std::atan2(-R(0, 1), R(1, 1));
+  roll = std::atan2(-R(2, 0), R(2, 2));
+  return std::isfinite(yaw) && std::isfinite(pitch) && std::isfinite(roll);
+}
+
+double reprojectionRmse(
+    const std::vector<cv::Point3f>& object_points,
+    const std::vector<cv::Point2f>& observed_points,
+    const cv::Mat& rvec,
+    const cv::Mat& tvec,
+    const cv::Mat& camera_matrix,
+    const cv::Mat& dist_coeffs) {
+  if (object_points.size() != 4 || observed_points.size() != 4 ||
+      rvec.empty() || tvec.empty()) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  std::vector<cv::Point2f> projected_points;
+  cv::projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs,
+                    projected_points);
+  if (projected_points.size() != observed_points.size()) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  double squared_error_sum = 0.0;
+  for (std::size_t i = 0; i < observed_points.size(); ++i) {
+    if (!std::isfinite(projected_points[i].x) ||
+        !std::isfinite(projected_points[i].y) ||
+        !std::isfinite(observed_points[i].x) ||
+        !std::isfinite(observed_points[i].y)) {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+    const cv::Point2f error = observed_points[i] - projected_points[i];
+    squared_error_sum += static_cast<double>(error.dot(error));
+  }
+  const double rmse = std::sqrt(squared_error_sum /
+                                static_cast<double>(observed_points.size()));
+  return std::isfinite(rmse)
+      ? rmse : std::numeric_limits<double>::quiet_NaN();
+}
+
 std::mutex      g_ypr_mtx;
 std::ofstream   g_ypr_ofs;
 std::size_t     g_line_no = 0;      // 当前行对应的 frame 编号（会自动从现有文件续上）
@@ -211,7 +286,10 @@ cv::Point2f ArmorSolver::project3DToPixel(const cv::Point3f& world_point) const 
 }
 
 // 修改solveArmor函数实现
-AimResult ArmorSolver::solveArmor(const ArmorResult& armor_result, const double last_pitch_rad_, const double last_yaw_rad_) const {
+AimResult ArmorSolver::solveArmor(const ArmorResult& armor_result,
+                                  double last_pitch_rad_,
+                                  double last_yaw_rad_,
+                                  double last_roll_rad_) const {
     
     AimResult result;
     result.valid = false;
@@ -220,7 +298,13 @@ AimResult ArmorSolver::solveArmor(const ArmorResult& armor_result, const double 
     int number = armor_result.number;
     
     // 计算相机到水平系的旋转矩阵
-    Eigen::Matrix3d R_imu_camera = ba_ -> RPYTorotationMatrix(Eigen::Vector3d(last_pitch_rad_, last_yaw_rad_, 0));
+    // Keep the BA input exactly as before; BA is diagnostic-only in the current
+    // EKF path. The full camera roll is included separately in the exact
+    // NormalFrame transform used by raw/refined measurement yaw below.
+    Eigen::Matrix3d R_imu_camera = ba_ -> RPYTorotationMatrix(
+        Eigen::Vector3d(last_pitch_rad_, last_yaw_rad_, 0));
+    const Eigen::Matrix3d R_world_camera = normalRotationFromYpr(
+        last_yaw_rad_, last_pitch_rad_, last_roll_rad_);
 
     // Eigen::Matrix3d R_imu_camera = ba_ -> RPYTorotationMatrix(Eigen::Vector3d(2, 1, 0));
     // auto rpy_wc = ba_ -> rotationMatrixToRPY(R_imu_camera);
@@ -271,6 +355,146 @@ AimResult ArmorSolver::solveArmor(const ArmorResult& armor_result, const double 
             cv::Mat rmat;
             cv::Rodrigues(rvec, rmat);
             Eigen::Matrix3d R = fyt::utils::cvToEigen(rmat);
+            Eigen::Vector3d t = fyt::utils::cvToEigen(tvec);
+
+            // The four PnP object points and light-bar observations use the
+            // same index ordering. Compute the true four-corner pixel RMSE
+            // before any yaw refinement.
+            result.reprojection_rmse_raw_px = reprojectionRmse(
+                armor_points_3d, armor_result.armor.light_bar_corners,
+                rvec, tvec, camera_matrix, dist_coeffs);
+
+            // Object points lie in z=0. Their stored winding
+            // left-up -> left-down -> right-down -> right-up defines -Z as the
+            // local plane normal. The absolute dot below removes the expected
+            // two-sided planar-normal ambiguity.
+            const Eigen::Vector3d normal_object(0.0, 0.0, -1.0);
+            const Eigen::Vector3d normal_camera = R * normal_object;
+            const double t_norm = t.norm();
+            if (normal_camera.allFinite() && std::isfinite(t_norm) &&
+                t_norm > 1e-9) {
+                const Eigen::Vector3d camera_to_armor = t / t_norm;
+                const double abs_cos = std::clamp(
+                    std::abs(normal_camera.normalized().dot(camera_to_armor)),
+                    0.0, 1.0);
+                result.facing_angle_rad = std::acos(abs_cos);
+            }
+
+            // Exact convention mapping:
+            // R_camera_normal = A * R_object_to_camera_cv * A^T.
+            // The old EKF yaw is the yaw extracted after applying the current
+            // camera-to-world RestFrame rotation.
+            const Eigen::Matrix3d R_camera_armor =
+                kCvToNormal * R * kCvToNormal.transpose();
+            const Eigen::Matrix3d R_world_armor =
+                R_world_camera * R_camera_armor;
+            double raw_yaw = 0.0;
+            double raw_pitch = 0.0;
+            double raw_roll = 0.0;
+            const bool reconstructable = normalYprFromRotation(
+                R_world_armor, raw_yaw, raw_pitch, raw_roll);
+            if (std::isfinite(raw_yaw) && std::isfinite(raw_pitch) &&
+                std::isfinite(raw_roll)) {
+                result.yaw_raw = wrapToPi(raw_yaw);
+                result.yaw_used = result.yaw_raw;
+            }
+            if (!reconstructable) {
+                result.yaw_refinement_status = "INVALID_GEOMETRY";
+            }
+
+            if (!yaw_refinement_.enabled) {
+                result.yaw_refinement_status = "DISABLED";
+            } else if (reconstructable &&
+                       std::isfinite(result.reprojection_rmse_raw_px) &&
+                       yaw_refinement_.search_half_range_rad > 0.0 &&
+                       yaw_refinement_.coarse_step_rad > 0.0 &&
+                       yaw_refinement_.fine_step_rad > 0.0) {
+                auto rmse_for_delta = [&](double delta,
+                                          cv::Mat* candidate_rvec) {
+                    const double candidate_yaw = wrapToPi(result.yaw_raw + delta);
+                    const Eigen::Matrix3d R_world_candidate =
+                        normalRotationFromYpr(candidate_yaw, raw_pitch, raw_roll);
+                    const Eigen::Matrix3d R_camera_candidate =
+                        R_world_camera.transpose() * R_world_candidate;
+                    const Eigen::Matrix3d R_cv_candidate =
+                        kCvToNormal.transpose() * R_camera_candidate * kCvToNormal;
+                    if (!R_cv_candidate.allFinite()) {
+                        return std::numeric_limits<double>::quiet_NaN();
+                    }
+                    cv::Mat candidate_rotation;
+                    cv::eigen2cv(R_cv_candidate, candidate_rotation);
+                    cv::Mat local_rvec;
+                    cv::Rodrigues(candidate_rotation, local_rvec);
+                    if (candidate_rvec != nullptr) {
+                        *candidate_rvec = local_rvec;
+                    }
+                    return reprojectionRmse(
+                        armor_points_3d,
+                        armor_result.armor.light_bar_corners,
+                        local_rvec, tvec, camera_matrix, dist_coeffs);
+                };
+
+                double best_delta = 0.0;
+                double best_rmse = result.reprojection_rmse_raw_px;
+                const double half = yaw_refinement_.search_half_range_rad;
+                for (double delta = -half;
+                     delta <= half + 0.5 * yaw_refinement_.coarse_step_rad;
+                     delta += yaw_refinement_.coarse_step_rad) {
+                    const double bounded_delta = std::clamp(delta, -half, half);
+                    const double rmse = rmse_for_delta(bounded_delta, nullptr);
+                    if (std::isfinite(rmse) && rmse < best_rmse) {
+                        best_rmse = rmse;
+                        best_delta = bounded_delta;
+                    }
+                }
+
+                const double fine_min = std::max(
+                    -half, best_delta - yaw_refinement_.coarse_step_rad);
+                const double fine_max = std::min(
+                    half, best_delta + yaw_refinement_.coarse_step_rad);
+                for (double delta = fine_min;
+                     delta <= fine_max + 0.5 * yaw_refinement_.fine_step_rad;
+                     delta += yaw_refinement_.fine_step_rad) {
+                    const double bounded_delta = std::clamp(delta, fine_min, fine_max);
+                    const double rmse = rmse_for_delta(bounded_delta, nullptr);
+                    if (std::isfinite(rmse) && rmse < best_rmse) {
+                        best_rmse = rmse;
+                        best_delta = bounded_delta;
+                    }
+                }
+
+                result.yaw_refined = wrapToPi(result.yaw_raw + best_delta);
+                result.yaw_refinement_delta = wrapToPi(
+                    result.yaw_refined - result.yaw_raw);
+                result.reprojection_rmse_refined_px = best_rmse;
+
+                const double improvement =
+                    result.reprojection_rmse_raw_px - best_rmse;
+                const double relative_improvement = improvement /
+                    std::max(result.reprojection_rmse_raw_px, 1e-9);
+                const bool candidate_local =
+                    std::abs(result.yaw_refinement_delta) <= half + 1e-12;
+                result.yaw_refined_valid =
+                    std::isfinite(result.yaw_raw) &&
+                    std::isfinite(result.yaw_refined) &&
+                    std::isfinite(result.reprojection_rmse_raw_px) &&
+                    std::isfinite(result.reprojection_rmse_refined_px) &&
+                    candidate_local &&
+                    std::abs(result.yaw_refinement_delta) <
+                        yaw_refinement_.max_accept_delta_rad &&
+                    improvement > yaw_refinement_.min_rmse_improvement_px &&
+                    relative_improvement >
+                        yaw_refinement_.min_relative_improvement;
+                if (result.yaw_refined_valid) {
+                    result.yaw_used = result.yaw_refined;
+                    result.yaw_refinement_status = "ACCEPT";
+                } else {
+                    result.yaw_used = result.yaw_raw;
+                    result.yaw_refinement_status = "FALLBACK";
+                }
+            } else if (reconstructable) {
+                result.yaw_refinement_status = "INVALID_GEOMETRY";
+            }
 
             // 现打印ba优化之前的参数
             auto rpy_before = ba_ -> rotationMatrixToRPY(R);
@@ -280,8 +504,6 @@ AimResult ArmorSolver::solveArmor(const ArmorResult& armor_result, const double 
             // RCLCPP_DEBUG(logger_p, "pitch before ba: %.2f" , rpy_before[0]);
             // RCLCPP_DEBUG(logger_p, "yaw before ba: %.2f" , rpy_before[1]);
             // RCLCPP_DEBUG(logger_p, "roll before ba: %.2f" , rpy_before[2]);
-
-            Eigen::Vector3d t = fyt::utils::cvToEigen(tvec);
 
             R = ba_-> solveBa(armor_result, t, R, R_imu_camera);
             // 将优化后的旋转矩阵转化为RPY

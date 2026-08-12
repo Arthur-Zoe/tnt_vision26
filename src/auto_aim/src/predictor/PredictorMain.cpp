@@ -135,6 +135,14 @@ PredictorResult PredictorMain::step(std::vector<ArmorResult>& classifyResults,
         }
     }
     target_manager_->drawOverlay(frame, ekf_state);
+    if (chosen_result.yaw_debug.available) {
+        chosen_result.yaw_debug.target_state =
+            TargetManager::stateName(target_status.state);
+    }
+    if (chosen_result.geometry_debug.available) {
+        chosen_result.geometry_debug.target_state =
+            TargetManager::stateName(target_status.state);
+    }
 
     return chosen_result;
 }

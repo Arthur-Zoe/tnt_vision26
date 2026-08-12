@@ -25,6 +25,8 @@
 #include <unistd.h>
 #include <limits.h>
 #include <queue>
+#include <fstream>
+#include <iomanip>
 #include "communication/Com.h"
 #include <csignal>
 #include "3d_processing/RestFrame.h"
@@ -82,6 +84,115 @@ public:
 
         // 加载配置文件
         config_file_ptr = std::make_shared<YAML::Node>(YAML::LoadFile(config_file_path));
+
+        const YAML::Node yaw_debug_config =
+            (*config_file_ptr)["yaw_refinement"];
+        yaw_debug_csv_enabled_ = yaw_debug_config["debug_csv"].as<bool>();
+        if (yaw_debug_csv_enabled_) {
+            yaw_debug_csv_.open(
+                yaw_debug_config["debug_csv_path"].as<std::string>(),
+                std::ios::out | std::ios::trunc);
+            if (yaw_debug_csv_) {
+                yaw_debug_csv_
+                    << "frame_id,timestamp_s,target_type,measurement_number,"
+                       "x_mm,y_mm,z_mm,yaw_raw_rad,yaw_refined_rad,"
+                       "yaw_used_rad,yaw_delta_rad,repr_raw_px,repr_refined_px,"
+                       "facing_angle_rad,refined_valid,refinement_status,"
+                       "ekf_yaw_rad,ekf_w_rad_s,nis,ekf_state,target_state,"
+                       "matched_armor_id,armor_switched\n";
+            } else {
+                yaw_debug_csv_enabled_ = false;
+                RCLCPP_ERROR(this->get_logger(),
+                             "Failed to open yaw debug CSV");
+            }
+        }
+
+        const YAML::Node geometry_debug_config =
+            (*config_file_ptr)["robust_ekf"]["geometry"];
+        geometry_debug_csv_enabled_ =
+            geometry_debug_config["debug_csv"].as<bool>();
+        if (geometry_debug_csv_enabled_) {
+            geometry_debug_csv_.open(
+                geometry_debug_config["debug_csv_path"].as<std::string>(),
+                std::ios::out | std::ios::trunc);
+            if (geometry_debug_csv_) {
+                geometry_debug_csv_ << std::unitbuf;
+                geometry_debug_csv_
+                    << "frame_id,timestamp_s,target_type,measurement_number,"
+                       "has_measurement,target_state,ekf_state,updated,"
+                       "measurement_valid,current_armor_id,r1_m,r2_m,h_m,"
+                       "p_r1_m2,p_r2_m2,p_h_m2,center_x_m,center_y_m,"
+                       "center_z_m,state_yaw_rad,w_rad_s,nis,matched_armor_id,"
+                       "armor_parity,armor_switched,direction_reversal,"
+                       "pending_sign_conflict,recovered,geometry_valid,"
+                       "geometry_update_allowed,geometry_preserved\n";
+            } else {
+                geometry_debug_csv_enabled_ = false;
+                RCLCPP_ERROR(this->get_logger(),
+                             "Failed to open geometry debug CSV");
+            }
+        }
+
+        association_debug_csv_enabled_ =
+            geometry_debug_config["association_debug_csv"].as<bool>();
+        if (association_debug_csv_enabled_) {
+            association_debug_csv_.open(
+                geometry_debug_config["association_debug_csv_path"]
+                    .as<std::string>(),
+                std::ios::out | std::ios::trunc);
+            if (association_debug_csv_) {
+                association_debug_csv_ << std::unitbuf;
+                association_debug_csv_
+                    << "frame_id,timestamp_s,target_type,target_state,ekf_state,"
+                       "tracker_state_before,measurement_number,current_armor_id,"
+                       "best_id,candidate_is_switch,armor_switched,"
+                       "temp_lost_recovery,recovered,phase_valid,phase_delta,"
+                       "phase_w,pending_sign_conflict,direction_reversal,"
+                       "topology_event,measurement_yaw,best_predicted_yaw,"
+                       "best_yaw_innovation,hypothetical_best_nis,"
+                       "hypothetical_best_nis_x,hypothetical_best_nis_y,"
+                       "hypothetical_best_nis_z,hypothetical_best_nis_yaw,"
+                       "hypothesis_id,"
+                       "is_current,selected,center_x_m,center_y_m,center_z_m,"
+                       "state_yaw_rad,r1_m,r2_m,h_m,p_r1_m2,p_r2_m2,p_h_m2,"
+                       "predicted_x_m,predicted_y_m,predicted_z_m,"
+                       "predicted_yaw_rad,facing_angle_rad,range_pass,"
+                       "visibility_pass,innovation_x_m,innovation_y_m,"
+                       "innovation_z_m,innovation_yaw_rad,position_error_m,"
+                       "yaw_error_rad,association_yaw_variance_scale,"
+                       "nis,nis_x,nis_y,nis_z,nis_yaw,"
+                       "hypothetical_scaled_nis,hypothetical_scaled_nis_x,"
+                       "hypothetical_scaled_nis_y,hypothetical_scaled_nis_z,"
+                       "hypothetical_scaled_nis_yaw,"
+                       "nis_gate_pass,position_gate_pass,yaw_gate_pass,"
+                       "passes_all_measurement_gates,radial_residual_m,"
+                       "tangential_residual_m,updated\n";
+            } else {
+                association_debug_csv_enabled_ = false;
+                RCLCPP_ERROR(this->get_logger(),
+                             "Failed to open association debug CSV");
+            }
+        }
+
+        lifecycle_debug_csv_enabled_ =
+            geometry_debug_config["lifecycle_debug_csv"].as<bool>();
+        if (lifecycle_debug_csv_enabled_) {
+            lifecycle_debug_csv_.open(
+                geometry_debug_config["lifecycle_debug_csv_path"]
+                    .as<std::string>(),
+                std::ios::out | std::ios::trunc);
+            if (lifecycle_debug_csv_) {
+                lifecycle_debug_csv_ << std::unitbuf;
+                lifecycle_debug_csv_
+                    << "frame_id,timestamp_s,target_state,target_type,"
+                       "has_measurement,measurement_number,ekf_state,"
+                       "ekf_updated,armor_switched,nis\n";
+            } else {
+                lifecycle_debug_csv_enabled_ = false;
+                RCLCPP_ERROR(this->get_logger(),
+                             "Failed to open lifecycle debug CSV");
+            }
+        }
 
 
 
@@ -609,6 +720,210 @@ private:
 // #endif
     }
 
+    void writeYawDebugCsv(std::uint64_t frame_id,
+                          double timestamp_s,
+                          const PredictorResult& predictor_result,
+                          const TargetManagerStatus& target_status) {
+        if (!yaw_debug_csv_enabled_ || !yaw_debug_csv_ ||
+            !predictor_result.yaw_debug.available) {
+            return;
+        }
+
+        const YawMeasurementDebug& debug = predictor_result.yaw_debug;
+        std::string target_name = "NONE";
+        if (target_status.target_type.has_value()) {
+            const auto index =
+                static_cast<std::size_t>(*target_status.target_type);
+            if (index < ArmorType::ArmorTypeStrings.size()) {
+                target_name = ArmorType::ArmorTypeStrings[index];
+            }
+        }
+
+        yaw_debug_csv_ << frame_id << ',' << std::setprecision(12)
+                       << timestamp_s << ',' << target_name << ','
+                       << debug.measurement_number << ','
+                       << debug.measurement_world_mm.x << ','
+                       << debug.measurement_world_mm.y << ','
+                       << debug.measurement_world_mm.z << ','
+                       << debug.yaw_raw_rad << ','
+                       << debug.yaw_refined_rad << ','
+                       << debug.yaw_used_rad << ','
+                       << debug.yaw_delta_rad << ','
+                       << debug.reprojection_rmse_raw_px << ','
+                       << debug.reprojection_rmse_refined_px << ','
+                       << debug.facing_angle_rad << ','
+                       << (debug.refined_valid ? 1 : 0) << ','
+                       << debug.refinement_status << ','
+                       << debug.ekf_yaw_rad << ','
+                       << debug.ekf_w_rad_s << ','
+                       << debug.nis << ','
+                       << debug.ekf_state << ','
+                       << debug.target_state << ','
+                       << debug.matched_armor_id << ','
+                       << (debug.armor_switched ? 1 : 0) << '\n';
+    }
+
+    void writeGeometryDebugCsv(
+        std::uint64_t frame_id,
+        double timestamp_s,
+        const PredictorResult& predictor_result,
+        const TargetManagerStatus& target_status) {
+        if (!geometry_debug_csv_enabled_ || !geometry_debug_csv_ ||
+            !predictor_result.geometry_debug.available) {
+            return;
+        }
+
+        const GeometryDebug& debug = predictor_result.geometry_debug;
+        std::string target_name = "NONE";
+        if (target_status.target_type.has_value()) {
+            const auto index =
+                static_cast<std::size_t>(*target_status.target_type);
+            if (index < ArmorType::ArmorTypeStrings.size()) {
+                target_name = ArmorType::ArmorTypeStrings[index];
+            }
+        }
+
+        geometry_debug_csv_ << frame_id << ',' << std::setprecision(12)
+                            << timestamp_s << ',' << target_name << ','
+                            << debug.measurement_number << ','
+                            << (predictor_result.has_measurement ? 1 : 0) << ','
+                            << debug.target_state << ',' << debug.ekf_state << ','
+                            << (debug.updated ? 1 : 0) << ','
+                            << (debug.measurement_valid ? 1 : 0) << ','
+                            << debug.current_armor_id << ','
+                            << debug.r1_m << ',' << debug.r2_m << ','
+                            << debug.h_m << ',' << debug.p_r1_m2 << ','
+                            << debug.p_r2_m2 << ',' << debug.p_h_m2 << ','
+                            << debug.center_x_m << ',' << debug.center_y_m << ','
+                            << debug.center_z_m << ',' << debug.state_yaw_rad << ','
+                            << debug.w_rad_s << ',' << debug.nis << ','
+                            << debug.matched_armor_id << ','
+                            << debug.armor_parity << ','
+                            << (debug.armor_switched ? 1 : 0) << ','
+                            << (debug.direction_reversal ? 1 : 0) << ','
+                            << (debug.pending_sign_conflict ? 1 : 0) << ','
+                            << (debug.recovered ? 1 : 0) << ','
+                            << (debug.geometry_valid ? 1 : 0) << ','
+                            << (debug.geometry_update_allowed ? 1 : 0) << ','
+                            << (debug.geometry_preserved ? 1 : 0) << '\n';
+    }
+
+    void writeAssociationDebugCsv(
+        std::uint64_t frame_id,
+        double timestamp_s,
+        const PredictorResult& predictor_result,
+        const TargetManagerStatus& target_status) {
+        if (!association_debug_csv_enabled_ || !association_debug_csv_ ||
+            !predictor_result.geometry_debug.available ||
+            !predictor_result.has_measurement) {
+            return;
+        }
+
+        const GeometryDebug& debug = predictor_result.geometry_debug;
+        std::string target_name = "NONE";
+        if (target_status.target_type.has_value()) {
+            const auto index =
+                static_cast<std::size_t>(*target_status.target_type);
+            if (index < ArmorType::ArmorTypeStrings.size()) {
+                target_name = ArmorType::ArmorTypeStrings[index];
+            }
+        }
+
+        for (const rm_ekf::AssociationHypothesisDebug& hypothesis :
+             debug.association_hypotheses) {
+            const rm_ekf::AssociationCandidate& measurement =
+                hypothesis.measurement;
+            const rm_ekf::AssociationCandidate& hypothetical =
+                hypothesis.hypothetical_scaled_yaw_measurement;
+            association_debug_csv_ << frame_id << ',' << std::setprecision(12)
+                << timestamp_s << ',' << target_name << ','
+                << debug.target_state << ',' << debug.ekf_state << ','
+                << debug.tracker_state_before << ','
+                << debug.measurement_number << ',' << debug.current_armor_id << ','
+                << debug.best_id << ','
+                << (debug.candidate_is_switch ? 1 : 0) << ','
+                << (debug.armor_switched ? 1 : 0) << ','
+                << (debug.temp_lost_recovery ? 1 : 0) << ','
+                << (debug.recovered ? 1 : 0) << ','
+                << (debug.phase_observer_valid ? 1 : 0) << ','
+                << debug.phase_delta << ',' << debug.phase_w_filtered << ','
+                << (debug.pending_sign_conflict ? 1 : 0) << ','
+                << (debug.direction_reversal ? 1 : 0) << ','
+                << (debug.topology_event ? 1 : 0) << ','
+                << debug.measurement_yaw << ',' << debug.predicted_yaw << ','
+                << debug.yaw_innovation << ','
+                << debug.hypothetical_scaled_nis << ','
+                << debug.hypothetical_scaled_nis_contribution(0) << ','
+                << debug.hypothetical_scaled_nis_contribution(1) << ','
+                << debug.hypothetical_scaled_nis_contribution(2) << ','
+                << debug.hypothetical_scaled_nis_contribution(3) << ','
+                << hypothesis.armor_id << ','
+                << (hypothesis.armor_id == debug.current_armor_id ? 1 : 0) << ','
+                << (debug.updated &&
+                    hypothesis.armor_id == debug.matched_armor_id ? 1 : 0) << ','
+                << debug.center_x_m << ',' << debug.center_y_m << ','
+                << debug.center_z_m << ',' << debug.state_yaw_rad << ','
+                << debug.r1_m << ',' << debug.r2_m << ',' << debug.h_m << ','
+                << debug.p_r1_m2 << ',' << debug.p_r2_m2 << ','
+                << debug.p_h_m2 << ',' << hypothesis.predicted.x << ','
+                << hypothesis.predicted.y << ',' << hypothesis.predicted.z << ','
+                << hypothesis.predicted.yaw << ',' << hypothesis.facing_angle << ','
+                << (hypothesis.range_pass ? 1 : 0) << ','
+                << (hypothesis.visibility_pass ? 1 : 0) << ','
+                << measurement.innovation(0) << ','
+                << measurement.innovation(1) << ','
+                << measurement.innovation(2) << ','
+                << measurement.innovation(3) << ','
+                << measurement.position_error << ',' << measurement.yaw_error << ','
+                << measurement.yaw_variance_scale << ','
+                << measurement.nis << ',' << measurement.nis_contribution(0) << ','
+                << measurement.nis_contribution(1) << ','
+                << measurement.nis_contribution(2) << ','
+                << measurement.nis_contribution(3) << ','
+                << hypothetical.nis << ','
+                << hypothetical.nis_contribution(0) << ','
+                << hypothetical.nis_contribution(1) << ','
+                << hypothetical.nis_contribution(2) << ','
+                << hypothetical.nis_contribution(3) << ','
+                << (hypothesis.nis_gate_pass ? 1 : 0) << ','
+                << (hypothesis.position_gate_pass ? 1 : 0) << ','
+                << (hypothesis.yaw_gate_pass ? 1 : 0) << ','
+                << (hypothesis.passes_all_measurement_gates ? 1 : 0) << ','
+                << hypothesis.radial_residual << ','
+                << hypothesis.tangential_residual << ','
+                << (debug.updated ? 1 : 0) << '\n';
+        }
+    }
+
+    void writeLifecycleDebugCsv(
+        std::uint64_t frame_id,
+        double timestamp_s,
+        const PredictorResult& predictor_result,
+        const TargetManagerStatus& target_status) {
+        if (!lifecycle_debug_csv_enabled_ || !lifecycle_debug_csv_) return;
+
+        std::string target_name = "NONE";
+        if (target_status.target_type.has_value()) {
+            const auto index =
+                static_cast<std::size_t>(*target_status.target_type);
+            if (index < ArmorType::ArmorTypeStrings.size()) {
+                target_name = ArmorType::ArmorTypeStrings[index];
+            }
+        }
+        const GeometryDebug& debug = predictor_result.geometry_debug;
+        lifecycle_debug_csv_ << frame_id << ',' << std::setprecision(12)
+            << timestamp_s << ',' << TargetManager::stateName(target_status.state)
+            << ',' << target_name << ','
+            << (predictor_result.has_measurement ? 1 : 0) << ','
+            << predictor_result.measurement_number << ','
+            << (debug.available ? debug.ekf_state : "NONE") << ','
+            << (debug.available && debug.updated ? 1 : 0) << ','
+            << (debug.available && debug.armor_switched ? 1 : 0) << ','
+            << (debug.available ? debug.nis
+                                : std::numeric_limits<double>::quiet_NaN())
+            << '\n';
+    }
+
     void processImage() {
     
 
@@ -714,7 +1029,9 @@ private:
 
             std::vector<ArmorResult> classifyResults_withSolveArmorResult;
             for (ArmorResult &classify_result : classifyResults) {
-                AimResult solve_armor_result = armor_solver_->solveArmor(classify_result, last_pitch_rad_delayed_, last_yaw_rad_delayed_);
+                AimResult solve_armor_result = armor_solver_->solveArmor(
+                    classify_result, last_pitch_rad_delayed_,
+                    last_yaw_rad_delayed_, last_roll_rad_delayed_);
                 cv::Point3f rest_frame_pos = rest_frame_ -> pnpToWorldP3f(solve_armor_result.position);
                 if (rest_frame_pos.z < max_armor_position_height && solve_armor_result.valid) { // 高度高于一定值视为无效
                     classifyResults_withSolveArmorResult.emplace_back(classify_result);
@@ -764,6 +1081,14 @@ private:
                 cv::Scalar(0, 255, 0), 1, 8, false);
             const TargetManagerStatus& target_status =
                 predictor_main_->targetManagerStatus();
+            writeYawDebugCsv(frame_id, frame_timestamp_s,
+                             predictor_result, target_status);
+            writeGeometryDebugCsv(frame_id, frame_timestamp_s,
+                                  predictor_result, target_status);
+            writeAssociationDebugCsv(frame_id, frame_timestamp_s,
+                                     predictor_result, target_status);
+            writeLifecycleDebugCsv(frame_id, frame_timestamp_s,
+                                   predictor_result, target_status);
             const std::string aiming_text = target_status.target_type.has_value()
                 ? "aiming " + ArmorType::ArmorTypeStrings[*target_status.target_type] +
                     ": " + ((*target_status.target_type == ArmorType::Outpost ||
@@ -951,6 +1276,15 @@ private:
     std::shared_ptr<TwoVideoLogger> two_video_logger;
     cv::Mat com_data_visualize_frame;
     bool com_data_visualize_frame_used = true;
+
+    bool yaw_debug_csv_enabled_ = false;
+    std::ofstream yaw_debug_csv_;
+    bool geometry_debug_csv_enabled_ = false;
+    std::ofstream geometry_debug_csv_;
+    bool association_debug_csv_enabled_ = false;
+    std::ofstream association_debug_csv_;
+    bool lifecycle_debug_csv_enabled_ = false;
+    std::ofstream lifecycle_debug_csv_;
 };
 
 std::shared_ptr<ArmorDetectNode> node;

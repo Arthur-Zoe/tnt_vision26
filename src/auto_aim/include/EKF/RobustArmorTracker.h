@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -61,8 +62,8 @@ struct RobustTrackerConfig {
     double sigma_pos_rw_xy = 0.054006;
     double sigma_pos_rw_z = 0.054006;
     double sigma_yaw_rw = 0.054391;
-    double sigma_radius_rw = 0.005477;
-    double sigma_height_rw = 0.005477;
+    double sigma_radius_rw = 0.0;
+    double sigma_height_rw = 0.0;
 
     double r_pos = 2e-3;
     double r_z = 2e-3;
@@ -99,6 +100,11 @@ struct RobustTrackerConfig {
     double input_max_abs_z = 2.50;
 
     double armor_visible_angle_deg = 70.0;
+    int geometry_stable_frames_before_update = 5;
+    bool geometry_reinit_covariance_floor_enabled = false;
+    double geometry_reinit_radius_variance_floor = 0.0;
+    double geometry_reinit_height_variance_floor = 0.0;
+    bool association_debug_enable = false;
 
     ArmorState initial_filter;
 
@@ -107,21 +113,47 @@ struct RobustTrackerConfig {
 
 struct AssociationCandidate {
     int armor_id = -1;
+    double yaw_variance_scale = 1.0;
     Eigen::Matrix<double, 4, 1> predicted = Eigen::Matrix<double, 4, 1>::Zero();
     Eigen::Matrix<double, 4, 1> innovation = Eigen::Matrix<double, 4, 1>::Zero();
     double nis = 1e30;
     double position_error = 1e30;
     double yaw_error = 1e30;
+    Eigen::Matrix<double, 4, 1> nis_contribution =
+        Eigen::Matrix<double, 4, 1>::Constant(
+            std::numeric_limits<double>::quiet_NaN());
     bool numerically_valid = false;
+};
+
+struct AssociationHypothesisDebug {
+    int armor_id = -1;
+    ArmorObservation predicted;
+    double facing_angle = std::numeric_limits<double>::quiet_NaN();
+    bool range_pass = false;
+    bool visibility_pass = false;
+    AssociationCandidate measurement;
+    AssociationCandidate hypothetical_scaled_yaw_measurement;
+    double radial_residual = std::numeric_limits<double>::quiet_NaN();
+    double tangential_residual = std::numeric_limits<double>::quiet_NaN();
+    bool nis_gate_pass = false;
+    bool position_gate_pass = false;
+    bool yaw_gate_pass = false;
+    bool passes_all_measurement_gates = false;
 };
 
 class ArmorModel {
 public:
-    static ArmorObservation getArmor(const ArmorState& s, int armor_id, double predict_time = 0.0);
-    static std::vector<ArmorObservation> getArmors(const ArmorState& s, double predict_time = 0.0);
-    static double facingScore(const ArmorState& s, const ArmorObservation& armor, double predict_time = 0.0);
-    static Eigen::Matrix<double, 4, 1> measurementFunction(const Eigen::Matrix<double, 11, 1>& X, int armor_id);
-    static Eigen::Matrix<double, 4, 11> measurementJacobian(const Eigen::Matrix<double, 11, 1>& X, int armor_id);
+    static ArmorObservation getArmor(const ArmorState& s, int armor_id,
+                                     double predict_time = 0.0);
+    static std::vector<ArmorObservation> getArmors(
+        const ArmorState& s, double predict_time = 0.0);
+    static double facingScore(const ArmorState& s,
+                              const ArmorObservation& armor,
+                              double predict_time = 0.0);
+    static Eigen::Matrix<double, 4, 1> measurementFunction(
+        const Eigen::Matrix<double, 11, 1>& X, int armor_id);
+    static Eigen::Matrix<double, 4, 11> measurementJacobian(
+        const Eigen::Matrix<double, 11, 1>& X, int armor_id);
 };
 
 class ArmorEKF {
@@ -134,9 +166,17 @@ public:
     ArmorState state() const { return ArmorState::fromVector(X_); }
 
     void predict(double dt);
-    void update(const Eigen::Matrix<double, 4, 1>& z, int armor_id, double yaw_variance_scale = 1.0);
+    void update(const Eigen::Matrix<double, 4, 1>& z,
+                int armor_id,
+                double yaw_variance_scale = 1.0,
+                bool update_geometry = true);
     void updateAngularVelocity(double measured_w, double variance);
-    AssociationCandidate evaluateMeasurement(const Eigen::Matrix<double, 4, 1>& z, int armor_id) const;
+    AssociationCandidate evaluateMeasurement(
+        const Eigen::Matrix<double, 4, 1>& z,
+        int armor_id,
+        double yaw_variance_scale = 1.0) const;
+    std::array<double, 3> geometryVariances() const;
+    void setGeometryVariances(double var_r1, double var_r2, double var_h);
 
 private:
     void enforcePhysicalLimits();
@@ -152,8 +192,8 @@ private:
     double sigma_pos_rw_xy_ = 0.054006;
     double sigma_pos_rw_z_ = 0.054006;
     double sigma_yaw_rw_ = 0.054391;
-    double sigma_radius_rw_ = 0.005477;
-    double sigma_height_rw_ = 0.005477;
+    double sigma_radius_rw_ = 0.0;
+    double sigma_height_rw_ = 0.0;
 
     double min_radius_ = 0.08;
     double max_radius_ = 0.60;
@@ -172,29 +212,60 @@ const char* trackerStateName(TrackerState state);
 
 struct TrackerResult {
     TrackerState state = TrackerState::LOST;
+    TrackerState tracker_state_before = TrackerState::LOST;
     int matched_id = -1;
     bool measurement_valid = false;
     bool initialized_this_frame = false;
     bool updated = false;
     bool recovered = false;
+    bool temp_lost_recovery = false;
     bool armor_switched = false;
+    bool candidate_is_switch = false;
+    bool topology_event = false;
     int lost_frames = 0;
     int detect_count = 0;
     double nis = -1.0;
     double position_error = -1.0;
     double yaw_error = -1.0;
+    int best_id = -1;
+    double measurement_yaw = std::numeric_limits<double>::quiet_NaN();
+    double predicted_yaw = std::numeric_limits<double>::quiet_NaN();
+    double yaw_innovation = std::numeric_limits<double>::quiet_NaN();
+    double hypothetical_scaled_nis = std::numeric_limits<double>::quiet_NaN();
+    Eigen::Matrix<double, 4, 1> hypothetical_scaled_nis_contribution =
+        Eigen::Matrix<double, 4, 1>::Constant(
+            std::numeric_limits<double>::quiet_NaN());
 
     bool phase_observer_valid = false;
     double phase_delta = 0.0;
     double phase_w_instant = 0.0;
     double phase_w_filtered = 0.0;
     bool direction_reversal = false;
+    bool pending_sign_conflict = false;
     bool phase_w_applied = false;
+
+    bool geometry_valid = false;
+    bool geometry_update_allowed = false;
+    bool geometry_preserved = false;
+
+    int current_armor_id = -1;
+    std::array<AssociationHypothesisDebug, 4> association_hypotheses;
+};
+
+struct GeometryMemory {
+    double r1 = 0.0;
+    double r2 = 0.0;
+    double h = 0.0;
+    double var_r1 = 0.0;
+    double var_r2 = 0.0;
+    double var_h = 0.0;
+    bool valid = false;
 };
 
 class RobustArmorTracker {
 public:
     void configure(const RobustTrackerConfig& cfg);
+    void loseTrackPreserveGeometry();
     void clear();
 
     TrackerResult process(const std::optional<ArmorObservation>& measurement,
@@ -206,6 +277,10 @@ public:
     TrackerState trackerState() const { return state_; }
     int currentArmorId() const { return current_armor_id_; }
     ArmorState state() const { return ekf_.state(); }
+    std::array<double, 3> geometryVariances() const {
+        return ekf_.geometryVariances();
+    }
+    const GeometryMemory& geometryMemory() const { return geometry_memory_; }
     std::vector<ArmorObservation> predictArmors(double predict_time) const {
         return ArmorModel::getArmors(ekf_.state(), predict_time);
     }
@@ -224,11 +299,17 @@ private:
     ArmorState initializeStateFromMeasurement(const ArmorObservation& obs, int armor_id) const;
     AssociationCandidate chooseAssociation(const Eigen::Matrix<double, 4, 1>& z,
                                            int forced_physical_armor_id,
-                                           bool* armor_switched) const;
+                                           bool phase_conflict,
+                                           bool* armor_switched,
+                                           std::array<AssociationHypothesisDebug, 4>*
+                                               debug_hypotheses) const;
     TrackerResult handleMiss(TrackerResult result);
     PhaseUpdate observeRotationPhase(const ArmorObservation& obs, double dt);
     void resetPhaseObserver();
     void reset(const ArmorState& state, int physical_armor_id, TrackerState tracker_state);
+    bool geometryStateValid(const ArmorState& state) const;
+    void updateGeometryMemory();
+    void populateGeometryDebug(TrackerResult& result) const;
 
     RobustTrackerConfig cfg_;
     ArmorEKF ekf_;
@@ -237,6 +318,8 @@ private:
     int detect_count_ = 0;
     int detect_misses_ = 0;
     int lost_frames_ = 0;
+    int stable_association_frames_ = 0;
+    GeometryMemory geometry_memory_;
 
     bool have_phase_yaw_ = false;
     double last_phase_yaw_ = 0.0;

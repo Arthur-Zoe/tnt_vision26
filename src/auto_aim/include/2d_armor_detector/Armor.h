@@ -7,6 +7,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <yaml-cpp/yaml.h>
 #include <opencv2/opencv.hpp>
+#include <limits>
+#include <string>
 
 namespace ArmorType {
     enum ArmorType {
@@ -53,6 +55,19 @@ struct AimResult {
 
     double yaw;           // 装甲板Yaw角
     cv::Mat rvec;        // 装甲板旋转向量
+
+    // Single-frame PnP yaw measurement diagnostics. yaw_raw is the world-frame
+    // yaw that the pre-refinement pipeline supplied to the EKF. The raw PnP
+    // rvec/tvec and xyz translation are never replaced by refinement.
+    double yaw_raw = std::numeric_limits<double>::quiet_NaN();
+    double yaw_refined = std::numeric_limits<double>::quiet_NaN();
+    double yaw_used = std::numeric_limits<double>::quiet_NaN();
+    bool yaw_refined_valid = false;
+    double yaw_refinement_delta = std::numeric_limits<double>::quiet_NaN();
+    double reprojection_rmse_raw_px = std::numeric_limits<double>::quiet_NaN();
+    double reprojection_rmse_refined_px = std::numeric_limits<double>::quiet_NaN();
+    double facing_angle_rad = std::numeric_limits<double>::quiet_NaN();
+    std::string yaw_refinement_status = "DISABLED";
 
     std::vector<double> normal_euler_angles; // RestFrame中定义的坐标系下的欧拉角
 

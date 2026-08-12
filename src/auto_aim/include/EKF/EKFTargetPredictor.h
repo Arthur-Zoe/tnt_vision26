@@ -58,6 +58,7 @@ struct EKFTargetDebugState {
     double dt_s = 0.0;
     bool time_discontinuity = false;
     std::string tracker_state = "LOST";
+    std::string tracker_state_before = "LOST";
     int matched_id = -1;
     bool measurement_valid = false;
     bool updated = false;
@@ -66,17 +67,45 @@ struct EKFTargetDebugState {
     double position_error_m = -1.0;
     double yaw_error_deg = -1.0;
     bool phase_observer_valid = false;
+    double phase_delta = 0.0;
     double phase_w_instant = 0.0;
     double phase_w_filtered = 0.0;
     bool direction_reversal = false;
     bool armor_switched = false;
     bool recovered = false;
     bool phase_w_applied = false;
+    bool pending_sign_conflict = false;
+    bool temp_lost_recovery = false;
+    bool candidate_is_switch = false;
+    bool topology_event = false;
+    int best_id = -1;
+    double measurement_yaw = std::numeric_limits<double>::quiet_NaN();
+    double predicted_yaw = std::numeric_limits<double>::quiet_NaN();
+    double yaw_innovation = std::numeric_limits<double>::quiet_NaN();
+    double hypothetical_scaled_nis = std::numeric_limits<double>::quiet_NaN();
+    Eigen::Matrix<double, 4, 1> hypothetical_scaled_nis_contribution =
+        Eigen::Matrix<double, 4, 1>::Constant(
+            std::numeric_limits<double>::quiet_NaN());
+
+    double r1_m = std::numeric_limits<double>::quiet_NaN();
+    double r2_m = std::numeric_limits<double>::quiet_NaN();
+    double h_m = std::numeric_limits<double>::quiet_NaN();
+    double p_r1_m2 = std::numeric_limits<double>::quiet_NaN();
+    double p_r2_m2 = std::numeric_limits<double>::quiet_NaN();
+    double p_h_m2 = std::numeric_limits<double>::quiet_NaN();
+    int armor_parity = -1;
+    bool geometry_valid = false;
+    bool geometry_update_allowed = false;
+    bool geometry_preserved = false;
+    int current_armor_id = -1;
+    std::array<rm_ekf::AssociationHypothesisDebug, 4>
+        association_hypotheses;
+
 };
 
-// Engineering adapter around the project's sole 3D target-motion backend.
-// RobustArmorTracker owns all filtering, association and tracker-state behavior;
-// this class only handles project units, timestamps, misses and result mapping.
+// Engineering adapter for the Robust backend. RobustArmorTracker owns
+// filtering, association and tracker-state behavior; this class only selects
+// maps project units/timestamps/results.
 class EKFTargetPredictor {
 public:
     EKFTargetPredictor(const EKFTargetObservation& initial_observation,
@@ -85,6 +114,7 @@ public:
 
     void update(const EKFTargetObservation& observation);
     void missUpdate(double update_time);
+    void clear();
 
     EKFTargetPrediction predict(double predict_time) const;
     EKFTargetState state() const;

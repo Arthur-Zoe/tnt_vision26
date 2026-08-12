@@ -10,6 +10,7 @@
 #define _USE_MATH_DEFINES
 #include <cmath>
 #include <algorithm>
+#include <limits>
 
 #include <3d_processing/BallisticSolver.h>
 #include "3d_processing/ArmorSolver.h"
@@ -20,6 +21,83 @@
 #include "utils/SimpleDataFilter.h"
 #include "EKF/EKFTargetPredictor.h"
 #include "macro/AutoAimMacro.h"
+
+struct YawMeasurementDebug {
+    bool available = false;
+    int target_type = -1;
+    int measurement_number = -1;
+    cv::Point3f measurement_world_mm = cv::Point3f(
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::quiet_NaN());
+    double yaw_raw_rad = std::numeric_limits<double>::quiet_NaN();
+    double yaw_refined_rad = std::numeric_limits<double>::quiet_NaN();
+    double yaw_used_rad = std::numeric_limits<double>::quiet_NaN();
+    double yaw_delta_rad = std::numeric_limits<double>::quiet_NaN();
+    double reprojection_rmse_raw_px =
+        std::numeric_limits<double>::quiet_NaN();
+    double reprojection_rmse_refined_px =
+        std::numeric_limits<double>::quiet_NaN();
+    double facing_angle_rad = std::numeric_limits<double>::quiet_NaN();
+    bool refined_valid = false;
+    std::string refinement_status = "DISABLED";
+    double ekf_yaw_rad = std::numeric_limits<double>::quiet_NaN();
+    double ekf_w_rad_s = std::numeric_limits<double>::quiet_NaN();
+    double nis = std::numeric_limits<double>::quiet_NaN();
+    std::string ekf_state = "N/A";
+    int matched_armor_id = -1;
+    bool armor_switched = false;
+    std::string target_state = "LOST";
+};
+
+struct GeometryDebug {
+    bool available = false;
+    int target_type = -1;
+    int measurement_number = -1;
+    std::string target_state = "LOST";
+    std::string ekf_state = "LOST";
+    std::string tracker_state_before = "LOST";
+    double r1_m = std::numeric_limits<double>::quiet_NaN();
+    double r2_m = std::numeric_limits<double>::quiet_NaN();
+    double h_m = std::numeric_limits<double>::quiet_NaN();
+    double p_r1_m2 = std::numeric_limits<double>::quiet_NaN();
+    double p_r2_m2 = std::numeric_limits<double>::quiet_NaN();
+    double p_h_m2 = std::numeric_limits<double>::quiet_NaN();
+    double center_x_m = std::numeric_limits<double>::quiet_NaN();
+    double center_y_m = std::numeric_limits<double>::quiet_NaN();
+    double center_z_m = std::numeric_limits<double>::quiet_NaN();
+    double state_yaw_rad = std::numeric_limits<double>::quiet_NaN();
+    double w_rad_s = std::numeric_limits<double>::quiet_NaN();
+    double nis = std::numeric_limits<double>::quiet_NaN();
+    int matched_armor_id = -1;
+    int armor_parity = -1;
+    bool armor_switched = false;
+    bool direction_reversal = false;
+    bool pending_sign_conflict = false;
+    bool recovered = false;
+    bool temp_lost_recovery = false;
+    bool candidate_is_switch = false;
+    bool topology_event = false;
+    bool phase_observer_valid = false;
+    double phase_delta = 0.0;
+    double phase_w_filtered = 0.0;
+    int best_id = -1;
+    double measurement_yaw = std::numeric_limits<double>::quiet_NaN();
+    double predicted_yaw = std::numeric_limits<double>::quiet_NaN();
+    double yaw_innovation = std::numeric_limits<double>::quiet_NaN();
+    double hypothetical_scaled_nis = std::numeric_limits<double>::quiet_NaN();
+    Eigen::Matrix<double, 4, 1> hypothetical_scaled_nis_contribution =
+        Eigen::Matrix<double, 4, 1>::Constant(
+            std::numeric_limits<double>::quiet_NaN());
+    bool geometry_valid = false;
+    bool geometry_update_allowed = false;
+    bool geometry_preserved = false;
+    bool updated = false;
+    bool measurement_valid = false;
+    int current_armor_id = -1;
+    std::array<rm_ekf::AssociationHypothesisDebug, 4>
+        association_hypotheses;
+};
 
 struct PredictorResult {
     bool reset = true;
@@ -35,6 +113,8 @@ struct PredictorResult {
     bool has_measurement = false;
     int measurement_number = -1;
     cv::Point2f measurement_center;
+    YawMeasurementDebug yaw_debug;
+    GeometryDebug geometry_debug;
 
     struct {
         cv::Mat RMM_visualize_frame;   // robust-EKF top view (legacy name kept for logger compatibility)

@@ -98,10 +98,25 @@ RobustTrackerConfig RobustTrackerConfig::fromYaml(const YAML::Node& root, double
     readIfExists(n, "input_max_abs_z", cfg.input_max_abs_z);
     readIfExists(n, "armor_visible_angle_deg", cfg.armor_visible_angle_deg);
 
+    const YAML::Node geometry = n["geometry"];
+    readIfExists(geometry, "stable_frames_before_update",
+                 cfg.geometry_stable_frames_before_update);
+    const YAML::Node reinit_covariance_floor =
+        geometry["reinit_covariance_floor"];
+    readIfExists(reinit_covariance_floor, "enabled",
+                 cfg.geometry_reinit_covariance_floor_enabled);
+    readIfExists(reinit_covariance_floor, "radius_variance",
+                 cfg.geometry_reinit_radius_variance_floor);
+    readIfExists(reinit_covariance_floor, "height_variance",
+                 cfg.geometry_reinit_height_variance_floor);
+    readIfExists(geometry, "association_debug_csv",
+                 cfg.association_debug_enable);
+
     return cfg;
 }
 
-ArmorObservation ArmorModel::getArmor(const ArmorState& s, int armor_id, double predict_time) {
+ArmorObservation ArmorModel::getArmor(
+    const ArmorState& s, int armor_id, double predict_time) {
     const int i = ((armor_id % 4) + 4) % 4;
     const double cx = s.x + s.vx * predict_time;
     const double cy = s.y + s.vy * predict_time;
@@ -119,10 +134,13 @@ ArmorObservation ArmorModel::getArmor(const ArmorState& s, int armor_id, double 
     return obs;
 }
 
-std::vector<ArmorObservation> ArmorModel::getArmors(const ArmorState& s, double predict_time) {
+std::vector<ArmorObservation> ArmorModel::getArmors(
+    const ArmorState& s, double predict_time) {
     std::vector<ArmorObservation> armors;
     armors.reserve(4);
-    for (int i = 0; i < 4; ++i) armors.push_back(getArmor(s, i, predict_time));
+    for (int i = 0; i < 4; ++i) {
+        armors.push_back(getArmor(s, i, predict_time));
+    }
     return armors;
 }
 
@@ -266,20 +284,26 @@ void ArmorEKF::predict(double dt) {
 }
 
 AssociationCandidate ArmorEKF::evaluateMeasurement(
-    const Eigen::Matrix<double, 4, 1>& z, int armor_id) const {
+    const Eigen::Matrix<double, 4, 1>& z,
+    int armor_id,
+    double yaw_variance_scale) const {
     AssociationCandidate c;
     c.armor_id = ((armor_id % 4) + 4) % 4;
+    c.yaw_variance_scale = std::max(1.0, yaw_variance_scale);
     if (!initialized_) return c;
 
     c.predicted = ArmorModel::measurementFunction(X_, c.armor_id);
-    const Eigen::Matrix<double, 4, 11> H = ArmorModel::measurementJacobian(X_, c.armor_id);
+    const Eigen::Matrix<double, 4, 11> H =
+        ArmorModel::measurementJacobian(X_, c.armor_id);
 
     c.innovation = z - c.predicted;
     c.innovation(3) = wrapAngle(c.innovation(3));
     c.position_error = c.innovation.head<3>().norm();
     c.yaw_error = std::abs(c.innovation(3));
 
-    const Eigen::Matrix<double, 4, 4> S = H * P_ * H.transpose() + R_;
+    Eigen::Matrix<double, 4, 4> R_eff = R_;
+    R_eff(3, 3) *= c.yaw_variance_scale;
+    const Eigen::Matrix<double, 4, 4> S = H * P_ * H.transpose() + R_eff;
     const auto ldlt = S.ldlt();
     if (ldlt.info() != Eigen::Success) return c;
 
@@ -287,24 +311,28 @@ AssociationCandidate ArmorEKF::evaluateMeasurement(
     if (ldlt.info() != Eigen::Success || !solved.allFinite()) return c;
 
     c.nis = c.innovation.dot(solved);
+    c.nis_contribution = c.innovation.cwiseProduct(solved);
     c.numerically_valid = std::isfinite(c.nis) && c.nis >= 0.0;
     return c;
 }
 
 void ArmorEKF::update(const Eigen::Matrix<double, 4, 1>& z,
                       int armor_id,
-                      double yaw_variance_scale) {
+                      double yaw_variance_scale,
+                      bool update_geometry) {
     if (!initialized_) return;
 
     const int id = ((armor_id % 4) + 4) % 4;
-    const Eigen::Matrix<double, 4, 1> h = ArmorModel::measurementFunction(X_, id);
-    const Eigen::Matrix<double, 4, 11> H = ArmorModel::measurementJacobian(X_, id);
+    const Eigen::Matrix<double, 4, 1> h =
+        ArmorModel::measurementFunction(X_, id);
+    const Eigen::Matrix<double, 4, 11> H =
+        ArmorModel::measurementJacobian(X_, id);
 
     Eigen::Matrix<double, 4, 1> innovation = z - h;
     innovation(3) = wrapAngle(innovation(3));
 
     Eigen::Matrix<double, 4, 4> R_eff = R_;
-    R_eff(3, 3) *= std::max(1.0, yaw_variance_scale);
+    R_eff(3, 3) *= yaw_variance_scale;
     const Eigen::Matrix<double, 4, 4> S = H * P_ * H.transpose() + R_eff;
     const auto ldlt = S.ldlt();
     if (ldlt.info() != Eigen::Success) return;
@@ -312,7 +340,22 @@ void ArmorEKF::update(const Eigen::Matrix<double, 4, 1>& z,
     const Eigen::Matrix<double, 11, 4> PHt = P_ * H.transpose();
     const Eigen::Matrix<double, 4, 11> solved = ldlt.solve(PHt.transpose());
     if (ldlt.info() != Eigen::Success || !solved.allFinite()) return;
-    const Eigen::Matrix<double, 11, 4> K = solved.transpose();
+    Eigen::Matrix<double, 11, 4> K = solved.transpose();
+
+    // Geometry is static over predict(). On topology/recovery events, keep the
+    // normal motion/yaw correction but prevent the same innovation from
+    // rewriting geometry. During stable updates, apply the minimum parity
+    // observability mask: EVEN updates r1; ODD updates r2 and h.
+    if (!update_geometry) {
+        K.row(8).setZero();
+        K.row(9).setZero();
+        K.row(10).setZero();
+    } else if (id % 2 == 0) {
+        K.row(9).setZero();
+        K.row(10).setZero();
+    } else {
+        K.row(8).setZero();
+    }
 
     X_ += K * innovation;
     enforcePhysicalLimits();
@@ -336,13 +379,40 @@ void ArmorEKF::updateAngularVelocity(double measured_w, double variance) {
     const double S = P_(7, 7) + variance;
     if (!std::isfinite(S) || S <= 1e-12) return;
 
-    const Eigen::Matrix<double, 11, 1> K = P_.col(7) / S;
+    Eigen::Matrix<double, 11, 1> K = P_.col(7) / S;
+    // Angular velocity directly observes only w. Do not let its correction
+    // rewrite static geometry through accumulated cross covariance.
+    K(8) = 0.0;
+    K(9) = 0.0;
+    K(10) = 0.0;
     X_ += K * innovation;
     enforcePhysicalLimits();
 
     const Eigen::Matrix<double, 11, 11> I = Eigen::Matrix<double, 11, 11>::Identity();
     const Eigen::Matrix<double, 11, 11> A = I - K * H;
     P_ = A * P_ * A.transpose() + K * variance * K.transpose();
+    P_ = 0.5 * (P_ + P_.transpose());
+}
+
+std::array<double, 3> ArmorEKF::geometryVariances() const {
+    if (!initialized_) {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        return {nan, nan, nan};
+    }
+    return {P_(8, 8), P_(9, 9), P_(10, 10)};
+}
+
+void ArmorEKF::setGeometryVariances(double var_r1,
+                                    double var_r2,
+                                    double var_h) {
+    if (!initialized_) return;
+    // GeometryMemory intentionally stores the three parameter variances only.
+    // A soft-loss reinitialization starts a new motion covariance, so discard
+    // stale geometry cross-covariances instead of mixing them across epochs.
+    P_.block<3, 3>(8, 8).setZero();
+    if (std::isfinite(var_r1) && var_r1 >= 0.0) P_(8, 8) = var_r1;
+    if (std::isfinite(var_r2) && var_r2 >= 0.0) P_(9, 9) = var_r2;
+    if (std::isfinite(var_h) && var_h >= 0.0) P_(10, 10) = var_h;
     P_ = 0.5 * (P_ + P_.transpose());
 }
 
@@ -372,14 +442,20 @@ void RobustArmorTracker::resetPhaseObserver() {
     reversal_conflict_sum_ = 0.0;
 }
 
-void RobustArmorTracker::clear() {
+void RobustArmorTracker::loseTrackPreserveGeometry() {
     ekf_.invalidate();
     state_ = TrackerState::LOST;
     current_armor_id_ = -1;
     detect_count_ = 0;
     detect_misses_ = 0;
     lost_frames_ = 0;
+    stable_association_frames_ = 0;
     resetPhaseObserver();
+}
+
+void RobustArmorTracker::clear() {
+    loseTrackPreserveGeometry();
+    geometry_memory_ = GeometryMemory{};
 }
 
 void RobustArmorTracker::reset(const ArmorState& state,
@@ -393,7 +469,57 @@ void RobustArmorTracker::reset(const ArmorState& state,
                         : 1;
     detect_misses_ = 0;
     lost_frames_ = 0;
+    stable_association_frames_ = 0;
+    if (geometry_memory_.valid) {
+        double var_r1 = geometry_memory_.var_r1;
+        double var_r2 = geometry_memory_.var_r2;
+        double var_h = geometry_memory_.var_h;
+        if (cfg_.geometry_reinit_covariance_floor_enabled) {
+            const double radius_floor = std::max(
+                0.0, cfg_.geometry_reinit_radius_variance_floor);
+            const double height_floor = std::max(
+                0.0, cfg_.geometry_reinit_height_variance_floor);
+            var_r1 = std::max(var_r1, radius_floor);
+            var_r2 = std::max(var_r2, radius_floor);
+            var_h = std::max(var_h, height_floor);
+        }
+        ekf_.setGeometryVariances(
+            var_r1, var_r2, var_h);
+    }
     resetPhaseObserver();
+}
+
+bool RobustArmorTracker::geometryStateValid(const ArmorState& state) const {
+    return std::isfinite(state.r1) && std::isfinite(state.r2) &&
+           std::isfinite(state.h) &&
+           state.r1 >= cfg_.state_min_radius &&
+           state.r1 <= cfg_.state_max_radius &&
+           state.r2 >= cfg_.state_min_radius &&
+           state.r2 <= cfg_.state_max_radius &&
+           std::abs(state.h) <= cfg_.state_max_abs_h;
+}
+
+void RobustArmorTracker::updateGeometryMemory() {
+    if (state_ != TrackerState::TRACKING || !ekf_.initialized()) return;
+    const ArmorState geometry = ekf_.state();
+    const std::array<double, 3> variances = ekf_.geometryVariances();
+    if (!geometryStateValid(geometry) ||
+        !std::isfinite(variances[0]) || variances[0] < 0.0 ||
+        !std::isfinite(variances[1]) || variances[1] < 0.0 ||
+        !std::isfinite(variances[2]) || variances[2] < 0.0) {
+        return;
+    }
+    geometry_memory_.r1 = geometry.r1;
+    geometry_memory_.r2 = geometry.r2;
+    geometry_memory_.h = geometry.h;
+    geometry_memory_.var_r1 = variances[0];
+    geometry_memory_.var_r2 = variances[1];
+    geometry_memory_.var_h = variances[2];
+    geometry_memory_.valid = true;
+}
+
+void RobustArmorTracker::populateGeometryDebug(TrackerResult& result) const {
+    result.geometry_valid = geometry_memory_.valid;
 }
 
 bool RobustArmorTracker::validInput(const ArmorObservation& obs) const {
@@ -411,6 +537,11 @@ ArmorState RobustArmorTracker::initializeStateFromMeasurement(
     const ArmorObservation& obs, int armor_id) const {
     const int id = std::clamp(armor_id, 0, 3);
     ArmorState s = cfg_.initial_filter;
+    if (geometry_memory_.valid) {
+        s.r1 = geometry_memory_.r1;
+        s.r2 = geometry_memory_.r2;
+        s.h = geometry_memory_.h;
+    }
     const double r = (id % 2 == 0) ? s.r1 : s.r2;
     const double dz = (id % 2 == 0) ? 0.0 : s.h;
 
@@ -508,7 +639,9 @@ RobustArmorTracker::PhaseUpdate RobustArmorTracker::observeRotationPhase(
 AssociationCandidate RobustArmorTracker::chooseAssociation(
     const Eigen::Matrix<double, 4, 1>& z,
     int forced_physical_armor_id,
-    bool* armor_switched) const {
+    bool phase_conflict,
+    bool* armor_switched,
+    std::array<AssociationHypothesisDebug, 4>* debug_hypotheses) const {
     if (armor_switched) *armor_switched = false;
 
     auto passesGate = [this](const AssociationCandidate& c) {
@@ -518,10 +651,6 @@ AssociationCandidate RobustArmorTracker::chooseAssociation(
                c.yaw_error <= deg2rad(cfg_.association_max_yaw_error_deg);
     };
 
-    if (forced_physical_armor_id >= 0 && forced_physical_armor_id < 4) {
-        return ekf_.evaluateMeasurement(z, forced_physical_armor_id);
-    }
-
     AssociationCandidate best;
     best.nis = std::numeric_limits<double>::infinity();
     AssociationCandidate current;
@@ -529,17 +658,68 @@ AssociationCandidate RobustArmorTracker::chooseAssociation(
 
     const ArmorState predicted_state = ekf_.state();
     int visible_count = 0;
+    const bool recovery = state_ == TrackerState::TEMP_LOST;
+    auto yawScaleForCandidate = [this, recovery, phase_conflict](int id) {
+        const bool candidate_switch =
+            current_armor_id_ >= 0 && id != current_armor_id_;
+        const bool candidate_topology_event =
+            candidate_switch || recovery || phase_conflict;
+        return candidate_topology_event
+            ? cfg_.rotation_switch_yaw_r_scale : 1.0;
+    };
 
     for (int id = 0; id < 4; ++id) {
-        const ArmorObservation armor = ArmorModel::getArmor(predicted_state, id, 0.0);
+        const ArmorObservation armor = ArmorModel::getArmor(
+            predicted_state, id, 0.0);
         const double range = std::sqrt(armor.x * armor.x + armor.y * armor.y + armor.z * armor.z);
-        if (range < cfg_.input_min_range || range > cfg_.input_max_range) continue;
-
         const double facing = ArmorModel::facingScore(predicted_state, armor, 0.0);
-        if (facing > deg2rad(cfg_.armor_visible_angle_deg)) continue;
+        const bool range_pass =
+            range >= cfg_.input_min_range && range <= cfg_.input_max_range;
+        const bool visibility_pass =
+            facing <= deg2rad(cfg_.armor_visible_angle_deg);
+        const bool formal_eligible =
+            range_pass &&
+            (visibility_pass || id == current_armor_id_);
+        if (!formal_eligible && debug_hypotheses == nullptr) continue;
+        // Evaluate with the exact yaw covariance this candidate will use if it
+        // is selected. Current normal-tracking continuity stays at scale 1.
+        const AssociationCandidate c = ekf_.evaluateMeasurement(
+            z, id, yawScaleForCandidate(id));
+
+        if (debug_hypotheses != nullptr) {
+            AssociationHypothesisDebug& debug = (*debug_hypotheses)[id];
+            debug.armor_id = id;
+            debug.predicted = armor;
+            debug.facing_angle = facing;
+            debug.range_pass = range_pass;
+            debug.visibility_pass = visibility_pass;
+            debug.measurement = c;
+            debug.hypothetical_scaled_yaw_measurement =
+                ekf_.evaluateMeasurement(
+                    z, id, cfg_.rotation_switch_yaw_r_scale);
+            const double sin_yaw = std::sin(armor.yaw);
+            const double cos_yaw = std::cos(armor.yaw);
+            debug.radial_residual =
+                c.innovation(0) * sin_yaw - c.innovation(1) * cos_yaw;
+            debug.tangential_residual =
+                c.innovation(0) * cos_yaw + c.innovation(1) * sin_yaw;
+            debug.nis_gate_pass =
+                c.numerically_valid && c.nis <= cfg_.association_nis_gate;
+            debug.position_gate_pass =
+                c.numerically_valid &&
+                c.position_error <= cfg_.association_max_position_error;
+            debug.yaw_gate_pass =
+                c.numerically_valid &&
+                c.yaw_error <= deg2rad(cfg_.association_max_yaw_error_deg);
+            debug.passes_all_measurement_gates = passesGate(c);
+        }
+
+        // The current armor is a continuity candidate. Visibility may filter
+        // switch candidates, but it must not delete a current hypothesis that
+        // still passes the unchanged measurement gates.
+        if (!formal_eligible) continue;
 
         ++visible_count;
-        const AssociationCandidate c = ekf_.evaluateMeasurement(z, id);
         if (id == current_armor_id_) {
             current = c;
             have_current = true;
@@ -550,13 +730,25 @@ AssociationCandidate RobustArmorTracker::chooseAssociation(
     // If geometry became temporarily inconsistent, do not hard-deadlock association.
     if (visible_count == 0) {
         for (int id = 0; id < 4; ++id) {
-            const AssociationCandidate c = ekf_.evaluateMeasurement(z, id);
+            const AssociationCandidate& c =
+                debug_hypotheses != nullptr
+                    ? (*debug_hypotheses)[id].measurement
+                    : ekf_.evaluateMeasurement(
+                          z, id, yawScaleForCandidate(id));
             if (id == current_armor_id_) {
                 current = c;
                 have_current = true;
             }
             if (c.numerically_valid && c.nis < best.nis) best = c;
         }
+    }
+
+    if (forced_physical_armor_id >= 0 && forced_physical_armor_id < 4) {
+        return debug_hypotheses != nullptr
+            ? (*debug_hypotheses)[forced_physical_armor_id].measurement
+            : ekf_.evaluateMeasurement(
+                  z, forced_physical_armor_id,
+                  yawScaleForCandidate(forced_physical_armor_id));
     }
 
     if (!best.numerically_valid || !passesGate(best)) return best;
@@ -577,6 +769,7 @@ AssociationCandidate RobustArmorTracker::chooseAssociation(
 
 TrackerResult RobustArmorTracker::handleMiss(TrackerResult result) {
     result.updated = false;
+    stable_association_frames_ = 0;
 
     switch (state_) {
         case TrackerState::LOST:
@@ -584,7 +777,11 @@ TrackerResult RobustArmorTracker::handleMiss(TrackerResult result) {
         case TrackerState::DETECTING:
             ++detect_misses_;
             detect_count_ = 0;
-            if (detect_misses_ > cfg_.detect_max_misses) clear();
+            if (detect_misses_ > cfg_.detect_max_misses) {
+                const bool preserve = geometry_memory_.valid;
+                loseTrackPreserveGeometry();
+                result.geometry_preserved = preserve;
+            }
             break;
         case TrackerState::TRACKING:
             state_ = TrackerState::TEMP_LOST;
@@ -592,13 +789,18 @@ TrackerResult RobustArmorTracker::handleMiss(TrackerResult result) {
             break;
         case TrackerState::TEMP_LOST:
             ++lost_frames_;
-            if (lost_frames_ > cfg_.temp_lost_max_frames) clear();
+            if (lost_frames_ > cfg_.temp_lost_max_frames) {
+                const bool preserve = geometry_memory_.valid;
+                loseTrackPreserveGeometry();
+                result.geometry_preserved = preserve;
+            }
             break;
     }
 
     result.state = state_;
     result.lost_frames = lost_frames_;
     result.detect_count = detect_count_;
+    populateGeometryDebug(result);
     return result;
 }
 
@@ -607,6 +809,7 @@ TrackerResult RobustArmorTracker::process(
     double dt,
     int forced_physical_armor_id) {
     TrackerResult result;
+    result.tracker_state_before = state_;
 
     if (ekf_.initialized() && dt > 0.0) ekf_.predict(dt);
 
@@ -618,11 +821,13 @@ TrackerResult RobustArmorTracker::process(
 
     result.measurement_valid = true;
     const Eigen::Matrix<double, 4, 1> z = measurement->toVector();
+    result.measurement_yaw = z(3);
 
     if (state_ == TrackerState::LOST || !ekf_.initialized()) {
         const int init_id =
             (forced_physical_armor_id >= 0 && forced_physical_armor_id < 4)
                 ? forced_physical_armor_id : 0;
+        const bool restore_geometry = geometry_memory_.valid;
         reset(initializeStateFromMeasurement(*measurement, init_id),
               init_id,
               TrackerState::DETECTING);
@@ -634,6 +839,8 @@ TrackerResult RobustArmorTracker::process(
         result.matched_id = init_id;
         result.initialized_this_frame = true;
         result.detect_count = detect_count_;
+        result.geometry_preserved = restore_geometry;
+        populateGeometryDebug(result);
         return result;
     }
 
@@ -643,10 +850,34 @@ TrackerResult RobustArmorTracker::process(
     result.phase_w_instant = phase.instant_w;
     result.phase_w_filtered = phase.filtered_w;
     result.direction_reversal = phase.reversal_confirmed;
+    result.pending_sign_conflict = phase.pending_sign_conflict;
 
     bool armor_switched = false;
     AssociationCandidate chosen =
-        chooseAssociation(z, forced_physical_armor_id, &armor_switched);
+        chooseAssociation(z, forced_physical_armor_id,
+                          phase.pending_sign_conflict, &armor_switched,
+                          cfg_.association_debug_enable
+                              ? &result.association_hypotheses : nullptr);
+
+    result.current_armor_id = current_armor_id_;
+    result.best_id = chosen.armor_id;
+    result.candidate_is_switch =
+        current_armor_id_ >= 0 && chosen.armor_id >= 0 &&
+        chosen.armor_id != current_armor_id_;
+    result.temp_lost_recovery =
+        result.tracker_state_before == TrackerState::TEMP_LOST;
+    result.topology_event =
+        result.candidate_is_switch || result.temp_lost_recovery ||
+        phase.pending_sign_conflict;
+    result.predicted_yaw = chosen.predicted(3);
+    result.yaw_innovation = chosen.innovation(3);
+    if (cfg_.association_debug_enable && chosen.armor_id >= 0) {
+        const AssociationCandidate hypothetical = ekf_.evaluateMeasurement(
+            z, chosen.armor_id, cfg_.rotation_switch_yaw_r_scale);
+        result.hypothetical_scaled_nis = hypothetical.nis;
+        result.hypothetical_scaled_nis_contribution =
+            hypothetical.nis_contribution;
+    }
 
     result.nis = chosen.nis;
     result.position_error = chosen.position_error;
@@ -670,14 +901,26 @@ TrackerResult RobustArmorTracker::process(
     }
 
     const TrackerState before = state_;
-    const bool topology_event =
-        armor_switched ||
-        before == TrackerState::TEMP_LOST ||
-        phase.pending_sign_conflict;
-    const double yaw_r_scale =
-        topology_event ? cfg_.rotation_switch_yaw_r_scale : 1.0;
-
-    ekf_.update(z, chosen.armor_id, yaw_r_scale);
+    const bool recovered = before == TrackerState::TEMP_LOST;
+    const bool stable_geometry_association =
+        before == TrackerState::TRACKING &&
+        !armor_switched &&
+        !phase.reversal_confirmed &&
+        !phase.pending_sign_conflict &&
+        !recovered;
+    if (stable_geometry_association) {
+        ++stable_association_frames_;
+    } else {
+        stable_association_frames_ = 0;
+    }
+    const bool geometry_update_allowed =
+        stable_geometry_association &&
+        stable_association_frames_ >=
+            std::max(1, cfg_.geometry_stable_frames_before_update);
+    // AssociationCandidate owns the future-update measurement covariance.
+    // Do not derive topology or yaw scale again here.
+    ekf_.update(z, chosen.armor_id, chosen.yaw_variance_scale,
+                geometry_update_allowed);
 
     if (phase.valid) {
         if (phase.reversal_confirmed) {
@@ -704,13 +947,17 @@ TrackerResult RobustArmorTracker::process(
         state_ = TrackerState::TRACKING;
     }
 
+    if (geometry_update_allowed) updateGeometryMemory();
+
     result.state = state_;
     result.matched_id = chosen.armor_id;
     result.updated = true;
-    result.recovered = (before == TrackerState::TEMP_LOST);
+    result.recovered = recovered;
     result.armor_switched = armor_switched;
+    result.geometry_update_allowed = geometry_update_allowed;
     result.lost_frames = lost_frames_;
     result.detect_count = detect_count_;
+    populateGeometryDebug(result);
     return result;
 }
 

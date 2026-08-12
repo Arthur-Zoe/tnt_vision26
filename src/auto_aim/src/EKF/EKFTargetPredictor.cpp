@@ -123,6 +123,14 @@ void EKFTargetPredictor::missUpdate(double update_time) {
     }
 }
 
+void EKFTargetPredictor::clear() {
+    if (tracker_) tracker_->clear();
+    last_result_ = rm_ekf::TrackerResult{};
+    update_frames_ = 0;
+    debug_flip_flag_ = 1;
+    has_update_time_ = false;
+}
+
 EKFTargetPrediction EKFTargetPredictor::predict(double predict_time) const {
     EKFTargetPrediction result;
     if (!tracker_->hasState()) {
@@ -184,6 +192,8 @@ EKFTargetDebugState EKFTargetPredictor::debugState() const {
     debug.dt_s = last_dt_s_;
     debug.time_discontinuity = time_discontinuity_;
     debug.tracker_state = rm_ekf::trackerStateName(last_result_.state);
+    debug.tracker_state_before =
+        rm_ekf::trackerStateName(last_result_.tracker_state_before);
     debug.matched_id = last_result_.matched_id;
     debug.measurement_valid = last_result_.measurement_valid;
     debug.updated = last_result_.updated;
@@ -194,12 +204,51 @@ EKFTargetDebugState EKFTargetPredictor::debugState() const {
                               ? rm_ekf::rad2deg(last_result_.yaw_error)
                               : -1.0;
     debug.phase_observer_valid = last_result_.phase_observer_valid;
+    debug.phase_delta = last_result_.phase_delta;
     debug.phase_w_instant = last_result_.phase_w_instant;
     debug.phase_w_filtered = last_result_.phase_w_filtered;
     debug.direction_reversal = last_result_.direction_reversal;
     debug.armor_switched = last_result_.armor_switched;
     debug.recovered = last_result_.recovered;
     debug.phase_w_applied = last_result_.phase_w_applied;
+    debug.pending_sign_conflict = last_result_.pending_sign_conflict;
+    debug.temp_lost_recovery = last_result_.temp_lost_recovery;
+    debug.candidate_is_switch = last_result_.candidate_is_switch;
+    debug.topology_event = last_result_.topology_event;
+    debug.best_id = last_result_.best_id;
+    debug.measurement_yaw = last_result_.measurement_yaw;
+    debug.predicted_yaw = last_result_.predicted_yaw;
+    debug.yaw_innovation = last_result_.yaw_innovation;
+    debug.hypothetical_scaled_nis = last_result_.hypothetical_scaled_nis;
+    debug.hypothetical_scaled_nis_contribution =
+        last_result_.hypothetical_scaled_nis_contribution;
+    debug.geometry_update_allowed = last_result_.geometry_update_allowed;
+    debug.geometry_preserved = last_result_.geometry_preserved;
+    debug.current_armor_id = last_result_.current_armor_id;
+    debug.association_hypotheses = last_result_.association_hypotheses;
+    if (tracker_->hasState()) {
+        const rm_ekf::ArmorState geometry = tracker_->state();
+        const std::array<double, 3> variances = tracker_->geometryVariances();
+        debug.r1_m = geometry.r1;
+        debug.r2_m = geometry.r2;
+        debug.h_m = geometry.h;
+        debug.p_r1_m2 = variances[0];
+        debug.p_r2_m2 = variances[1];
+        debug.p_h_m2 = variances[2];
+    } else {
+        const rm_ekf::GeometryMemory& memory = tracker_->geometryMemory();
+        if (memory.valid) {
+            debug.r1_m = memory.r1;
+            debug.r2_m = memory.r2;
+            debug.h_m = memory.h;
+            debug.p_r1_m2 = memory.var_r1;
+            debug.p_r2_m2 = memory.var_r2;
+            debug.p_h_m2 = memory.var_h;
+        }
+    }
+    debug.geometry_valid = tracker_->geometryMemory().valid;
+    debug.armor_parity = debug.matched_id >= 0
+        ? debug.matched_id % 2 : -1;
     return debug;
 }
 

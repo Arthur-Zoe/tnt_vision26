@@ -34,6 +34,21 @@ target_manager:
   outpost_max_temp_lost_frames: 30
   enable_priority_switch: false
 
+# Single-frame PnP yaw diagnostics/refinement. Refinement changes only the
+# orientation used by the EKF; solvePnP translation and xyz remain untouched.
+yaw_refinement:
+  # Full-video validation found the local reprojection objective weakly
+  # observable for yaw, so keep EKF input on raw PnP yaw by default.
+  enabled: false
+  search_half_range_degree: 5.0
+  coarse_step_degree: 0.5
+  fine_step_degree: 0.1
+  max_accept_delta_degree: 3.0
+  min_rmse_improvement_px: 0.05
+  min_relative_improvement: 0.02
+  debug_csv: false
+  debug_csv_path: "/tmp/yaw_measurement_debug.csv"
+
 
 # Robust 11D EKF for normal four-armor vehicles.
 # Internal EKF units are meter / second / radian.
@@ -55,8 +70,21 @@ robust_ekf:
     sigma_pos_rw_xy: 0.054006   # m/sqrt(s)
     sigma_pos_rw_z: 0.054006    # m/sqrt(s)
     sigma_yaw_rw: 0.054391      # rad/sqrt(s)
-    sigma_radius_rw: 0.005477   # m/sqrt(s)
-    sigma_height_rw: 0.005477   # m/sqrt(s)
+    sigma_radius_rw: 0.0        # static geometry baseline
+    sigma_height_rw: 0.0        # static geometry baseline
+
+  geometry:
+    stable_frames_before_update: 5
+    reinit_covariance_floor:
+      enabled: false
+      radius_variance: 0.0005
+      height_variance: 0.0005
+    debug_csv: false
+    debug_csv_path: "/tmp/geometry_debug.csv"
+    association_debug_csv: false
+    association_debug_csv_path: "/tmp/association_debug.csv"
+    lifecycle_debug_csv: false
+    lifecycle_debug_csv_path: "/tmp/lifecycle_debug.csv"
 
   # Measurement covariance terms (variance, not standard deviation).
   r_pos: 0.002

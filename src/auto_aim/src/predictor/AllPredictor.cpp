@@ -1,6 +1,105 @@
 #include "predictor/AllPredictor.h"
 #include "utils/DataProcessFuncs.h"
 
+namespace {
+
+constexpr double kRadToDeg = 180.0 / M_PI;
+
+std::string angleText(double radians)
+{
+    return std::isfinite(radians)
+        ? cv::format("%.2f deg", radians * kRadToDeg)
+        : std::string("N/A");
+}
+
+std::string pixelText(double pixels)
+{
+    return std::isfinite(pixels)
+        ? cv::format("%.2f px", pixels)
+        : std::string("N/A");
+}
+
+void drawYawMeasurementPanel(cv::Mat& image,
+                             const YawMeasurementDebug& debug)
+{
+    if (image.empty() || !debug.available) return;
+
+    const int panel_width = std::min(390, std::max(0, image.cols - 20));
+    const int x = std::max(10, image.cols - panel_width - 10);
+    constexpr int y = 10;
+    constexpr int panel_height = 242;
+    cv::rectangle(image, cv::Rect(x, y, panel_width, panel_height),
+                  cv::Scalar(20, 20, 20), cv::FILLED);
+
+    const std::vector<std::string> lines = {
+        "yaw raw : " + angleText(debug.yaw_raw_rad),
+        "yaw ref : " + angleText(debug.yaw_refined_rad),
+        "yaw use : " + angleText(debug.yaw_used_rad),
+        "dyaw    : " + angleText(debug.yaw_delta_rad),
+        "repr raw: " + pixelText(debug.reprojection_rmse_raw_px),
+        "repr ref: " + pixelText(debug.reprojection_rmse_refined_px),
+        "facing  : " + angleText(debug.facing_angle_rad),
+        "refine  : " + debug.refinement_status,
+    };
+    const cv::Scalar status_color = debug.refined_valid
+        ? cv::Scalar(0, 255, 0)
+        : (debug.refinement_status == "FALLBACK"
+               ? cv::Scalar(0, 165, 255)
+               : cv::Scalar(0, 255, 255));
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        cv::putText(image, lines[i],
+                    cv::Point(x + 10, y + 27 + static_cast<int>(i) * 28),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.58,
+                    i + 1 == lines.size() ? status_color
+                                          : cv::Scalar(230, 230, 230),
+                    1, cv::LINE_AA);
+    }
+}
+
+void drawGeometryPanel(cv::Mat& image, const GeometryDebug& debug)
+{
+    if (image.empty() || !debug.available) return;
+
+    const int panel_width = std::min(390, std::max(0, image.cols - 20));
+    const int x = std::max(10, image.cols - panel_width - 10);
+    constexpr int y = 260;
+    constexpr int panel_height = 330;
+    cv::rectangle(image, cv::Rect(x, y, panel_width, panel_height),
+                  cv::Scalar(20, 20, 20), cv::FILLED);
+
+    const std::string parity = debug.armor_parity == 0
+        ? "EVEN" : (debug.armor_parity == 1 ? "ODD" : "N/A");
+    std::vector<std::string> lines = {
+        cv::format("geometry r1/r2/h: %.4f %.4f %.4f m",
+                   debug.r1_m, debug.r2_m, debug.h_m),
+        cv::format("P r1/r2/h: %.6f %.6f %.6f",
+                   debug.p_r1_m2, debug.p_r2_m2, debug.p_h_m2),
+        "matched: " + std::to_string(debug.matched_armor_id) +
+            " parity: " + parity,
+        "switch: " + std::to_string(debug.armor_switched ? 1 : 0) +
+            " reversal: " + std::to_string(debug.direction_reversal ? 1 : 0),
+        "sign_conflict: " +
+            std::to_string(debug.pending_sign_conflict ? 1 : 0) +
+            " recovered: " + std::to_string(debug.recovered ? 1 : 0),
+        "geometry valid: " + std::to_string(debug.geometry_valid ? 1 : 0),
+        "update allowed: " +
+            std::to_string(debug.geometry_update_allowed ? 1 : 0),
+        "preserved: " + std::to_string(debug.geometry_preserved ? 1 : 0),
+        cv::format("w: %.3f rad/s  NIS: %.3f", debug.w_rad_s, debug.nis),
+        "EKF: " + debug.ekf_state,
+    };
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        cv::putText(image, lines[i],
+                    cv::Point(x + 10, y + 26 + static_cast<int>(i) * 27),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.50,
+                    debug.geometry_preserved ? cv::Scalar(255, 180, 0)
+                                             : cv::Scalar(230, 230, 230),
+                    1, cv::LINE_AA);
+    }
+}
+
+}  // namespace
+
 void AllPredictor::update_serial_info(float bullet_velocity, float last_pitch_rad_delayed, float last_yaw_rad_delayed, float total_yaw_rad_delayed) {
     bullet_velocity_ = bullet_velocity;
     last_pitch_rad_delayed_ = last_pitch_rad_delayed;
@@ -11,14 +110,13 @@ void AllPredictor::update_serial_info(float bullet_velocity, float last_pitch_ra
 void AllPredictor::resetTarget()
 {
     if (ekf_target_predictor_) {
-        const EKFTargetState ekf_state = ekf_target_predictor_->state();
-        if (ekf_state.update_frames > 90) {
-            init_r = (ekf_state.r1 + ekf_state.r2) / 2.0F;
-        }
-        if (!(init_r >= 200.0F)) init_r = 200.0F;
-        if (!(init_r <= 400.0F)) init_r = 400.0F;
+        // TargetManager release is a hard physical-target boundary. Explicitly
+        // clear GeometryMemory. A new physical vehicle must never inherit the
+        // old target's geometry.
+        ekf_target_predictor_->clear();
     }
     ekf_target_predictor_.reset();
+    init_r = 250.0F;
     target_active_ = false;
     has_valid_ballistic = false;
     last_total_delay_ = 0.0F;
@@ -124,6 +222,28 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
             std::vector<float> rest_frame_euler_angles = rest_frame_ -> getWorldEulerAnglesFromCam(
                 solve_armor_result.normal_euler_angles[0], solve_armor_result.normal_euler_angles[1], solve_armor_result.normal_euler_angles[2]);
 
+            result.yaw_debug.available = true;
+            result.yaw_debug.target_type = static_cast<int>(armor_class);
+            result.yaw_debug.measurement_number = chosen_armor.number;
+            result.yaw_debug.measurement_world_mm = rest_frame_pos;
+            result.yaw_debug.yaw_raw_rad = solve_armor_result.yaw_raw;
+            result.yaw_debug.yaw_refined_rad = solve_armor_result.yaw_refined;
+            result.yaw_debug.yaw_used_rad =
+                solve_armor_result.yaw_refined_valid
+                    ? solve_armor_result.yaw_refined
+                    : solve_armor_result.yaw_raw;
+            result.yaw_debug.yaw_delta_rad =
+                solve_armor_result.yaw_refinement_delta;
+            result.yaw_debug.reprojection_rmse_raw_px =
+                solve_armor_result.reprojection_rmse_raw_px;
+            result.yaw_debug.reprojection_rmse_refined_px =
+                solve_armor_result.reprojection_rmse_refined_px;
+            result.yaw_debug.facing_angle_rad =
+                solve_armor_result.facing_angle_rad;
+            result.yaw_debug.refined_valid =
+                solve_armor_result.yaw_refined_valid;
+            result.yaw_debug.refinement_status =
+                solve_armor_result.yaw_refinement_status;
             RCLCPP_DEBUG(node->get_logger(), "camera euler angles: yaw=%.2f, pitch=%.2f, roll=%.2f", solve_armor_result.normal_euler_angles[0], solve_armor_result.normal_euler_angles[1], solve_armor_result.normal_euler_angles[2]);
             RCLCPP_DEBUG(node->get_logger(), "Rest frame pos: x=%.2f, y=%.2f, z=%.2f, yaw=%.2f", rest_frame_pos.x, rest_frame_pos.y, rest_frame_pos.z, rest_frame_euler_angles[0]);
 
@@ -199,7 +319,9 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
                 rest_frame_pos.x,
                 rest_frame_pos.y,
                 rest_frame_pos.z,
-                rest_frame_euler_angles[0],
+                solve_armor_result.yaw_refined_valid
+                    ? solve_armor_result.yaw_refined
+                    : solve_armor_result.yaw_raw,
                 RMM_update_time
             });
 
@@ -294,6 +416,75 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
 
             EKFTargetState RMM_state = ekf_target_predictor_->state();
             EKFTargetDebugState RMM_debug = ekf_target_predictor_->debugState();
+            result.geometry_debug.available = true;
+            result.geometry_debug.target_type = static_cast<int>(armor_class);
+            result.geometry_debug.measurement_number =
+                current_measurement != nullptr ? current_measurement->number : -1;
+            result.geometry_debug.ekf_state = RMM_debug.tracker_state;
+            result.geometry_debug.tracker_state_before =
+                RMM_debug.tracker_state_before;
+            result.geometry_debug.r1_m = RMM_debug.r1_m;
+            result.geometry_debug.r2_m = RMM_debug.r2_m;
+            result.geometry_debug.h_m = RMM_debug.h_m;
+            result.geometry_debug.p_r1_m2 = RMM_debug.p_r1_m2;
+            result.geometry_debug.p_r2_m2 = RMM_debug.p_r2_m2;
+            result.geometry_debug.p_h_m2 = RMM_debug.p_h_m2;
+            result.geometry_debug.center_x_m = RMM_state.center_x / 1000.0;
+            result.geometry_debug.center_y_m = RMM_state.center_y / 1000.0;
+            result.geometry_debug.center_z_m = RMM_state.center_z / 1000.0;
+            result.geometry_debug.state_yaw_rad = RMM_state.yaw;
+            result.geometry_debug.w_rad_s = RMM_state.w;
+            result.geometry_debug.nis = RMM_debug.nis >= 0.0
+                ? RMM_debug.nis
+                : std::numeric_limits<double>::quiet_NaN();
+            result.geometry_debug.matched_armor_id = RMM_debug.matched_id;
+            result.geometry_debug.armor_parity = RMM_debug.armor_parity;
+            result.geometry_debug.armor_switched = RMM_debug.armor_switched;
+            result.geometry_debug.direction_reversal =
+                RMM_debug.direction_reversal;
+            result.geometry_debug.pending_sign_conflict =
+                RMM_debug.pending_sign_conflict;
+            result.geometry_debug.recovered = RMM_debug.recovered;
+            result.geometry_debug.temp_lost_recovery =
+                RMM_debug.temp_lost_recovery;
+            result.geometry_debug.candidate_is_switch =
+                RMM_debug.candidate_is_switch;
+            result.geometry_debug.topology_event = RMM_debug.topology_event;
+            result.geometry_debug.phase_observer_valid =
+                RMM_debug.phase_observer_valid;
+            result.geometry_debug.phase_delta = RMM_debug.phase_delta;
+            result.geometry_debug.phase_w_filtered =
+                RMM_debug.phase_w_filtered;
+            result.geometry_debug.best_id = RMM_debug.best_id;
+            result.geometry_debug.measurement_yaw = RMM_debug.measurement_yaw;
+            result.geometry_debug.predicted_yaw = RMM_debug.predicted_yaw;
+            result.geometry_debug.yaw_innovation = RMM_debug.yaw_innovation;
+            result.geometry_debug.hypothetical_scaled_nis =
+                RMM_debug.hypothetical_scaled_nis;
+            result.geometry_debug.hypothetical_scaled_nis_contribution =
+                RMM_debug.hypothetical_scaled_nis_contribution;
+            result.geometry_debug.geometry_valid = RMM_debug.geometry_valid;
+            result.geometry_debug.geometry_update_allowed =
+                RMM_debug.geometry_update_allowed;
+            result.geometry_debug.geometry_preserved =
+                RMM_debug.geometry_preserved;
+            result.geometry_debug.updated = RMM_debug.updated;
+            result.geometry_debug.measurement_valid =
+                RMM_debug.measurement_valid;
+            result.geometry_debug.current_armor_id =
+                RMM_debug.current_armor_id;
+            result.geometry_debug.association_hypotheses =
+                RMM_debug.association_hypotheses;
+            if (result.yaw_debug.available) {
+                result.yaw_debug.ekf_yaw_rad = RMM_state.yaw;
+                result.yaw_debug.ekf_w_rad_s = RMM_state.w;
+                result.yaw_debug.nis = RMM_debug.nis >= 0.0
+                    ? RMM_debug.nis
+                    : std::numeric_limits<double>::quiet_NaN();
+                result.yaw_debug.ekf_state = RMM_debug.tracker_state;
+                result.yaw_debug.matched_armor_id = RMM_debug.matched_id;
+                result.yaw_debug.armor_switched = RMM_debug.armor_switched;
+            }
             cv::putText(RMM_visualize_frame, 
                 "EKF w:"+std::to_string(RMM_state.w),
                 cv::Point2f(20,80), 
@@ -579,7 +770,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
                 }
 
                 std::string ekf_title = cv::format(
-                    "REAL PROJECT EKF  t=%.3fs  dt=%.1fms",
+                    "ROBUST TARGET EKF  t=%.3fs  dt=%.1fms",
                     RMM_update_time, RMM_debug.dt_s * 1000.0);
                 if (RMM_debug.time_discontinuity) {
                     ekf_title += "  TIME RESET";
@@ -595,7 +786,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
                 cv::putText(
                     RMM_visualize_frame,
                     cv::format(
-                        "center=(%.3f,%.3f,%.3f)m yaw=%.1fdeg w=%.2frad/s",
+                        "center=(%.3f,%.3f,%.3f)m EKF_yaw=%.1fdeg w=%.2frad/s",
                         RMM_state.center_x / 1000.0,
                         RMM_state.center_y / 1000.0,
                         RMM_state.center_z / 1000.0,
@@ -603,6 +794,15 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
                         RMM_state.w),
                     cv::Point(14, 49), cv::FONT_HERSHEY_SIMPLEX, 0.50,
                     cv::Scalar(50, 50, 50), 1, cv::LINE_AA);
+
+                cv::putText(
+                    RMM_visualize_frame,
+                    result.yaw_debug.available
+                        ? cv::format("measurement_yaw=%.1fdeg",
+                                     result.yaw_debug.yaw_used_rad * kRadToDeg)
+                        : std::string("measurement_yaw=NA"),
+                    cv::Point(14, 144), cv::FONT_HERSHEY_SIMPLEX, 0.50,
+                    cv::Scalar(100, 40, 120), 1, cv::LINE_AA);
 
                 const cv::Scalar tracker_color =
                     RMM_debug.tracker_state == "TRACKING"
@@ -799,10 +999,17 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
                     EKF_camera_overlay_frame,
                     "EKF " + RMM_debug.tracker_state +
                         "  matched=" + std::to_string(RMM_debug.matched_id) +
-                        cv::format("  w=%.2f  NIS=%.2f",
+                        cv::format("  meas_yaw=%.1f  ekf_yaw=%.1f  w=%.2f  NIS=%.2f",
+                                   result.yaw_debug.yaw_used_rad * kRadToDeg,
+                                   RMM_state.yaw * kRadToDeg,
                                    RMM_state.w, RMM_debug.nis),
                     cv::Point(14, 28), cv::FONT_HERSHEY_SIMPLEX, 0.58,
                     cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+
+                drawYawMeasurementPanel(EKF_camera_overlay_frame,
+                                        result.yaw_debug);
+                drawGeometryPanel(EKF_camera_overlay_frame,
+                                  result.geometry_debug);
 
                 result.info_images.RMM_visualize_frame = RMM_visualize_frame;
                 result.info_images.EKF_vertical_frame = EKF_vertical_frame;
@@ -812,6 +1019,9 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
         }
         // ========================== Robust EKF =========================== END
     }
+
+    drawYawMeasurementPanel(frame, result.yaw_debug);
+    drawGeometryPanel(frame, result.geometry_debug);
 
     // 统一转换回pnp相机坐标系    
     predicted_aim_pos = rest_frame_ -> worldToPnpP3f(predicted_aim_pos);
@@ -897,7 +1107,6 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
     result.armor_type = armor_class;
     result.pixel_horizontal_center_distance = last_pixel_horizontal_center_distance;
     result.latest_armor_distance = latest_armor_distance;
-
     if(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - latest_predicting_start_time).count()
         < pre_predict_time_not_aim) {
 
