@@ -29,9 +29,11 @@ RMM_visualize_zoom_out_factor : 10.0 # 平面可视化缩放系数，该值越�
 # Persistent vehicle target lifecycle. Acquisition policies (Nearest/Middle or
 # a concrete armor class) are evaluated only while this state machine is LOST.
 target_manager:
-  min_detect_frames: 3
+  # Keep the outer project target-lifecycle gate synchronized with the
+  # SuperPower standard3 tracker. The SP tracker remains the EKF authority.
+  min_detect_frames: 5
   max_temp_lost_frames: 15
-  outpost_max_temp_lost_frames: 30
+  outpost_max_temp_lost_frames: 75
   enable_priority_switch: false
 
 # Single-frame PnP yaw diagnostics/refinement. Refinement changes only the
@@ -49,16 +51,40 @@ yaw_refinement:
   debug_csv: false
   debug_csv_path: "/tmp/yaw_measurement_debug.csv"
 
+# Evaluator-only PnP diagnostics. The formal runtime continues to use the
+# current corrected light-bar corners and scale 1.00 result.
+pnp_diagnostic:
+  csv_enabled: false
+  csv_path: "/tmp/radius2_pnp.csv"
+  # The calibration file does not currently carry resolution metadata.
+  calibration_resolution_known: false
+  calibration_width: 0
+  calibration_height: 0
+  detector_input_width: 640
+  detector_input_height: 640
 
-# Robust 11D EKF for normal four-armor vehicles.
+
+# 11D whole-vehicle EKF for normal four-armor vehicles.
+# SuperPower 2025 EKF baseline now used by EKFTargetPredictor.
+# Source code baseline: TongjiSuperPower/sp_vision_25
+# commit ce3e1ce05ea57bef9813bba0c450ff158388f0a2
+# Normal four-armor branch from configs/standard3.yaml / Tracker::set_target().
+superpower_ekf:
+  min_detect_count: 5
+  max_temp_lost_count: 15
+  max_dt_s: 0.1
+  initial_radius_m: 0.2
+  armor_num: 4
+
 # Internal EKF units are meter / second / radian.
-# Robust EKF configuration. Measurement/association/state-machine values below are unchanged.
+# LEGACY / INACTIVE: previous RobustArmorTracker tuning retained only for
+# rollback/reference. EKFTargetPredictor no longer reads this block.
 robust_ekf:
   # Initialization used by the standalone v4 replay that passed the recorded-data test.
   # These are meters. For a different physical robot, replace them with its measured geometry.
-  initial_r1: 0.24
-  initial_r2: 0.31
-  initial_h: 0.09
+  initial_r1: 0.5
+  initial_r2: 0.5
+  initial_h: 0.03
 
   # Continuous-time process-noise standard deviations. At 30 FPS the
   # acceleration terms preserve the old velocity noise, while position/yaw
@@ -75,6 +101,13 @@ robust_ekf:
 
   geometry:
     stable_frames_before_update: 5
+    # G2 diagnostic only: zero radius Kalman correction rows without clamping
+    # radius state values. Keep false for the normal learned-geometry G1 run.
+    freeze_radius_kalman_rows: true
+    # G2b diagnostic: additionally make the fixed radii statistically certain.
+    # Radius rows/columns are isolated after every predict/update.
+    statistically_fixed_radius: true
+    fixed_radius_variance: 1.0e-8
     reinit_covariance_floor:
       enabled: false
       radius_variance: 0.0005
@@ -85,6 +118,16 @@ robust_ekf:
     association_debug_csv_path: "/tmp/association_debug.csv"
     lifecycle_debug_csv: false
     lifecycle_debug_csv_path: "/tmp/lifecycle_debug.csv"
+
+  # Provisional evaluation references only. They are never used by EKF update,
+  # constraints, association, or geometry initialization.
+  geometry_debug_reference:
+    r1: 0.5
+    r2: 0.5
+    h: 0.03
+    r1_tolerance: 0.03
+    r2_tolerance: 0.03
+    h_tolerance: 0.02
 
   # Measurement covariance terms (variance, not standard deviation).
   r_pos: 0.002
@@ -122,6 +165,18 @@ robust_ekf:
   input_max_range: 8.00
   input_max_abs_z: 2.50
   armor_visible_angle_deg: 70.0
+
+# Source-timestamp EKF time-series diagnostics. Plotting and CSV logging are
+# independent and default off in normal runtime.
+ekf_debug_plot:
+  enabled: false
+  history_seconds: 10.0
+  width: 1280
+  panel_height: 120
+  csv_enabled: false
+  csv_path: "/tmp/ekf_debug.csv"
+  save_latest_png: false
+  screenshot_path: "/tmp/ekf_debug_curves.png"
 
 
 frame_rate : 30.0   # fps

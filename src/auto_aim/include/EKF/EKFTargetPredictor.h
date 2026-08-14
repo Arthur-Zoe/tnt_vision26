@@ -1,13 +1,18 @@
 #pragma once
 
-#include <memory>
+#include <array>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include <yaml-cpp/yaml.h>
 
+// Kept only because the existing debug/CSV/visualization ABI uses this
+// hypothesis type. RobustArmorTracker is no longer the runtime estimator.
 #include "EKF/RobustArmorTracker.h"
+#include "EKF/SuperPowerTracker.h"
 
 struct EKFTargetObservation {
     double x;
@@ -54,6 +59,9 @@ struct EKFTargetState {
     unsigned long long update_frames = 0;
 };
 
+// This struct is intentionally kept source-compatible with the pre-existing
+// robust-EKF visualizer/logger. Fields that only existed for the old phase
+// observer/reversal recovery stay at their neutral defaults under SP-EKF.
 struct EKFTargetDebugState {
     double dt_s = 0.0;
     bool time_discontinuity = false;
@@ -82,6 +90,22 @@ struct EKFTargetDebugState {
     double measurement_yaw = std::numeric_limits<double>::quiet_NaN();
     double predicted_yaw = std::numeric_limits<double>::quiet_NaN();
     double yaw_innovation = std::numeric_limits<double>::quiet_NaN();
+    Eigen::Matrix<double, 4, 1> measurement =
+        Eigen::Matrix<double, 4, 1>::Constant(
+            std::numeric_limits<double>::quiet_NaN());
+    Eigen::Matrix<double, 4, 1> pre_predicted = measurement;
+    Eigen::Matrix<double, 4, 1> post_predicted = measurement;
+    Eigen::Matrix<double, 3, 1> pre_residual =
+        Eigen::Matrix<double, 3, 1>::Constant(
+            std::numeric_limits<double>::quiet_NaN());
+    Eigen::Matrix<double, 3, 1> post_residual = pre_residual;
+    double pre_position_error = std::numeric_limits<double>::quiet_NaN();
+    double post_position_error = std::numeric_limits<double>::quiet_NaN();
+    double residual_radial = std::numeric_limits<double>::quiet_NaN();
+    double residual_tangential = std::numeric_limits<double>::quiet_NaN();
+    double nis_xyz = std::numeric_limits<double>::quiet_NaN();
+    double nis_yaw = std::numeric_limits<double>::quiet_NaN();
+    double yaw_variance_scale = 1.0;
     double hypothetical_scaled_nis = std::numeric_limits<double>::quiet_NaN();
     Eigen::Matrix<double, 4, 1> hypothetical_scaled_nis_contribution =
         Eigen::Matrix<double, 4, 1>::Constant(
@@ -93,6 +117,10 @@ struct EKFTargetDebugState {
     double p_r1_m2 = std::numeric_limits<double>::quiet_NaN();
     double p_r2_m2 = std::numeric_limits<double>::quiet_NaN();
     double p_h_m2 = std::numeric_limits<double>::quiet_NaN();
+    double p_x_m2 = std::numeric_limits<double>::quiet_NaN();
+    double p_vx_m2_s2 = std::numeric_limits<double>::quiet_NaN();
+    double p_y_m2 = std::numeric_limits<double>::quiet_NaN();
+    double p_vy_m2_s2 = std::numeric_limits<double>::quiet_NaN();
     int armor_parity = -1;
     bool geometry_valid = false;
     bool geometry_update_allowed = false;
@@ -100,12 +128,11 @@ struct EKFTargetDebugState {
     int current_armor_id = -1;
     std::array<rm_ekf::AssociationHypothesisDebug, 4>
         association_hypotheses;
-
 };
 
-// Engineering adapter for the Robust backend. RobustArmorTracker owns
-// filtering, association and tracker-state behavior; this class only selects
-// maps project units/timestamps/results.
+// Boundary adapter around the SuperPower 2025 normal four-armor
+// Target/Tracker/EKF path.  Internally SP units/conventions are preserved;
+// this class only converts project millimetres/timestamps/yaw convention.
 class EKFTargetPredictor {
 public:
     EKFTargetPredictor(const EKFTargetObservation& initial_observation,
@@ -125,18 +152,22 @@ public:
     int debugFlipFlag() const { return debug_flip_flag_; }
 
 private:
-    static rm_ekf::ArmorObservation toMeters(
+    static sp_ekf::ArmorObservation toSuperPower(
         const EKFTargetObservation& observation);
+    static double toProjectYaw(double superpower_angle);
+    static double wrapAngle(double angle);
+
     void resetTracker();
     void initializeFromObservation(const EKFTargetObservation& observation);
     void warnTimeIssue(const char* reason, double update_time, double dt);
 
-    std::unique_ptr<rm_ekf::RobustArmorTracker> tracker_;
-    rm_ekf::RobustTrackerConfig config_;
-    rm_ekf::TrackerResult last_result_;
+    sp_ekf::TrackerConfig config_;
+    std::unique_ptr<sp_ekf::Tracker> tracker_;
+    sp_ekf::TrackerResult last_result_;
+    std::optional<sp_ekf::ArmorObservation> last_observation_;
+
     double last_update_time_ = 0.0;
     double last_dt_s_ = 0.0;
-    double max_tracking_gap_s_ = std::numeric_limits<double>::infinity();
     unsigned long long update_frames_ = 0;
     int debug_flip_flag_ = 1;
     bool has_update_time_ = false;

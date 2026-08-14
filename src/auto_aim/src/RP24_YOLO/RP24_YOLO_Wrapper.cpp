@@ -121,6 +121,14 @@ vector<Armor> RP24YOLOWrapper::detectArmors(cv::Mat& frame, string detect_color,
         cv::RotatedRect leftLightBar(leftLightBar_center, leftLightBar_size, leftLightBar_angle);
         cv::RotatedRect rightLightBar(rightLightBar_center, rightLightBar_size, rightLightBar_angle);
         armors.emplace_back(leftLightBar, rightLightBar, config_file_ptr, node);
+        // Preserve the network's four direct endpoints before the 0.82 light
+        // length reconstruction used by the current formal PnP corners.
+        armors.back().raw_detector_corners = {
+            cv::Point2f(frame_keypoints[0], frame_keypoints[1]),
+            cv::Point2f(frame_keypoints[2], frame_keypoints[3]),
+            cv::Point2f(frame_keypoints[4], frame_keypoints[5]),
+            cv::Point2f(frame_keypoints[6], frame_keypoints[7])};
+        armors.back().raw_to_current_light_length_scale = lightBarLengthScale;
 
         if (rp24_classes != nullptr) {
             rp24_classes->push_back(object.label);

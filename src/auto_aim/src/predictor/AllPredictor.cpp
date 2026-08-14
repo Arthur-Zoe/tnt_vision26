@@ -77,14 +77,10 @@ void drawGeometryPanel(cv::Mat& image, const GeometryDebug& debug)
         "matched: " + std::to_string(debug.matched_armor_id) +
             " parity: " + parity,
         "switch: " + std::to_string(debug.armor_switched ? 1 : 0) +
-            " reversal: " + std::to_string(debug.direction_reversal ? 1 : 0),
-        "sign_conflict: " +
-            std::to_string(debug.pending_sign_conflict ? 1 : 0) +
-            " recovered: " + std::to_string(debug.recovered ? 1 : 0),
+            " (SP physical armor id)",
         "geometry valid: " + std::to_string(debug.geometry_valid ? 1 : 0),
-        "update allowed: " +
+        "measurement update: " +
             std::to_string(debug.geometry_update_allowed ? 1 : 0),
-        "preserved: " + std::to_string(debug.geometry_preserved ? 1 : 0),
         cv::format("w: %.3f rad/s  NIS: %.3f", debug.w_rad_s, debug.nis),
         "EKF: " + debug.ekf_state,
     };
@@ -110,13 +106,12 @@ void AllPredictor::update_serial_info(float bullet_velocity, float last_pitch_ra
 void AllPredictor::resetTarget()
 {
     if (ekf_target_predictor_) {
-        // TargetManager release is a hard physical-target boundary. Explicitly
-        // clear GeometryMemory. A new physical vehicle must never inherit the
-        // old target's geometry.
+        // TargetManager release is a hard physical-target boundary. Clear the
+        // SuperPower Target so a new vehicle cannot inherit its EKF state.
         ekf_target_predictor_->clear();
     }
     ekf_target_predictor_.reset();
-    init_r = 250.0F;
+    init_r = 200.0F;
     target_active_ = false;
     has_valid_ballistic = false;
     last_total_delay_ = 0.0F;
@@ -177,7 +172,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
     PredictorResult result;
 
     // Preserve the real camera image before predictor/debug drawing mutates `frame`.
-    // The dedicated EKF camera window is built only from this image plus robust-EKF data.
+    // The dedicated EKF camera window is built only from this image plus SuperPower-EKF data.
     const cv::Mat ekf_camera_base_frame = frame.clone();
 
     bool ballistic_valid_flag = false;
@@ -282,13 +277,14 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
 
 
 
-    // The validated RobustArmorTracker is a four-armor model. Outpost and Base
-    // intentionally keep direct current-observation aiming in this refactor.
+    // The copied SuperPower normal branch is the four-armor vehicle model.
+    // Outpost/Base remain on their existing direct-observation path because this
+    // project interface does not yet provide SuperPower ArmorName/ArmorType semantics.
     if (armor_class != ArmorType::Base && armor_class != ArmorType::Outpost) {
-        // ========================== Robust EKF ===========================
+        // ======================== SuperPower EKF ========================
         const double RMM_update_time = frame_timestamp_s;
         bool RMM_updated_flag = false;
-        // Scratch canvas is rebuilt below as the pure Robust-EKF top view.
+        // Scratch canvas is rebuilt below as the pure SuperPower-EKF top view.
         cv::Mat RMM_visualize_frame = cv::Mat::zeros(800, 800, CV_8UC3);
         cv::Mat EKF_vertical_frame;
         cv::Mat EKF_camera_overlay_frame;
@@ -371,14 +367,14 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
         }
 
         if (!RMM_updated_flag && ekf_target_predictor_) {
-            // Robust backend performs pure predict/TEMP_LOST here; no pseudo-measurement update.
+            // SuperPower tracker performs predict/TEMP_LOST here; no pseudo-measurement update.
             ekf_target_predictor_->missUpdate(RMM_update_time);
         }
 
 
 
-        if(ekf_target_predictor_) {
-            EKFTargetPrediction RMM_pred_now_data = ekf_target_predictor_ -> predict(0.0);
+        if (ekf_target_predictor_ && ekf_target_predictor_->hasState()) {
+            EKFTargetPrediction RMM_pred_now_data = ekf_target_predictor_->predict(0.0);
             cv::Point3f RMM_pred_now_center_p3f = rest_frame_ -> worldToPnpP3f({
                 static_cast<float>(RMM_pred_now_data.center_x), 
                 static_cast<float>(RMM_pred_now_data.center_y), 
@@ -432,6 +428,9 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
             result.geometry_debug.center_x_m = RMM_state.center_x / 1000.0;
             result.geometry_debug.center_y_m = RMM_state.center_y / 1000.0;
             result.geometry_debug.center_z_m = RMM_state.center_z / 1000.0;
+            result.geometry_debug.vx_m_s = RMM_state.center_vx / 1000.0;
+            result.geometry_debug.vy_m_s = RMM_state.center_vy / 1000.0;
+            result.geometry_debug.vz_m_s = RMM_state.center_vz / 1000.0;
             result.geometry_debug.state_yaw_rad = RMM_state.yaw;
             result.geometry_debug.w_rad_s = RMM_state.w;
             result.geometry_debug.nis = RMM_debug.nis >= 0.0
@@ -455,10 +454,32 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
             result.geometry_debug.phase_delta = RMM_debug.phase_delta;
             result.geometry_debug.phase_w_filtered =
                 RMM_debug.phase_w_filtered;
+            result.geometry_debug.phase_w_instant =
+                RMM_debug.phase_w_instant;
             result.geometry_debug.best_id = RMM_debug.best_id;
             result.geometry_debug.measurement_yaw = RMM_debug.measurement_yaw;
             result.geometry_debug.predicted_yaw = RMM_debug.predicted_yaw;
             result.geometry_debug.yaw_innovation = RMM_debug.yaw_innovation;
+            result.geometry_debug.measurement = RMM_debug.measurement;
+            result.geometry_debug.pre_predicted = RMM_debug.pre_predicted;
+            result.geometry_debug.post_predicted = RMM_debug.post_predicted;
+            result.geometry_debug.pre_residual = RMM_debug.pre_residual;
+            result.geometry_debug.post_residual = RMM_debug.post_residual;
+            result.geometry_debug.pre_position_error =
+                RMM_debug.pre_position_error;
+            result.geometry_debug.post_position_error =
+                RMM_debug.post_position_error;
+            result.geometry_debug.residual_radial = RMM_debug.residual_radial;
+            result.geometry_debug.residual_tangential =
+                RMM_debug.residual_tangential;
+            result.geometry_debug.nis_xyz = RMM_debug.nis_xyz;
+            result.geometry_debug.nis_yaw = RMM_debug.nis_yaw;
+            result.geometry_debug.yaw_variance_scale =
+                RMM_debug.yaw_variance_scale;
+            result.geometry_debug.p_x_m2 = RMM_debug.p_x_m2;
+            result.geometry_debug.p_vx_m2_s2 = RMM_debug.p_vx_m2_s2;
+            result.geometry_debug.p_y_m2 = RMM_debug.p_y_m2;
+            result.geometry_debug.p_vy_m2_s2 = RMM_debug.p_vy_m2_s2;
             result.geometry_debug.hypothetical_scaled_nis =
                 RMM_debug.hypothetical_scaled_nis;
             result.geometry_debug.hypothetical_scaled_nis_contribution =
@@ -504,11 +525,10 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
                 cv::FONT_HERSHEY_COMPLEX, 0.55,
                 cv::Scalar(0, 255, 255), 1, 8, false);
             cv::putText(RMM_visualize_frame,
-                "phase_w:"+std::to_string(RMM_debug.phase_w_filtered)+
-                (RMM_debug.direction_reversal ? " REVERSAL" : ""),
+                "SP assoc: nearest-3 angle+bearing",
                 cv::Point2f(20,345),
                 cv::FONT_HERSHEY_COMPLEX, 0.55,
-                RMM_debug.direction_reversal ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 255, 255),
+                cv::Scalar(0, 255, 255),
                 1, 8, false);
             if (ekf_warmup_complete && ekf_target_predictor_->ready()) {
                 EKFTargetPrediction RMM_pred_aim_data = ekf_target_predictor_ -> predict(total_delay);
@@ -576,11 +596,9 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
                     predicted_aim_pos = predicted_armor_pos;
                 }
                 fire_flag = RMM_fire_result.fire;
-                // Keep aiming continuous, but do not fire unless the robust tracker is stably TRACKING.
+                // Keep aiming continuous, but do not fire unless the SuperPower tracker is stably TRACKING.
                 if (!ekf_target_predictor_->ready() ||
-                    RMM_debug.armor_switched ||
-                    RMM_debug.recovered ||
-                    RMM_debug.direction_reversal) {
+                    RMM_debug.armor_switched) {
                     fire_flag = false;
                 }
 
@@ -656,7 +674,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
                 cv::Scalar(255, 0, 255), 2);
 
             // -----------------------------------------------------------------
-            // Pure robust-EKF visualization.
+            // Pure SuperPower-EKF visualization.
             // Semantics intentionally follow standalone v4 drawReplay():
             // measurement + EKF center + four armor hypotheses + matched-id
             // highlight + yaw arrows + NIS/residual/phase diagnostics.
@@ -747,8 +765,8 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
                                 color, 1, cv::LINE_AA);
 
                     const cv::Point arrow_end(
-                        static_cast<int>(p.x + 26 * std::cos(armor.yaw)),
-                        static_cast<int>(p.y - 26 * std::sin(armor.yaw)));
+                        static_cast<int>(p.x + 26 * std::sin(armor.yaw)),
+                        static_cast<int>(p.y + 26 * std::cos(armor.yaw)));
                     cv::arrowedLine(RMM_visualize_frame, p, arrow_end,
                                     color, 1, cv::LINE_AA, 0, 0.25);
                 }
@@ -770,7 +788,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
                 }
 
                 std::string ekf_title = cv::format(
-                    "ROBUST TARGET EKF  t=%.3fs  dt=%.1fms",
+                    "SUPERPOWER TARGET EKF  t=%.3fs  dt=%.1fms",
                     RMM_update_time, RMM_debug.dt_s * 1000.0);
                 if (RMM_debug.time_discontinuity) {
                     ekf_title += "  TIME RESET";
@@ -826,31 +844,19 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
                                RMM_debug.yaw_error_deg);
                 if (RMM_debug.armor_switched)
                     residual_line += "  ARMOR_SWITCH";
-                if (RMM_debug.recovered)
-                    residual_line += "  RECOVERED";
                 cv::putText(RMM_visualize_frame, residual_line,
                             cv::Point(14, 98),
                             cv::FONT_HERSHEY_SIMPLEX, 0.50,
                             cv::Scalar(80, 50, 20), 1, cv::LINE_AA);
 
-                std::string phase_line = "phase_w=";
-                if (RMM_debug.phase_observer_valid) {
-                    phase_line += cv::format("%.2f inst=%.2f",
-                                             RMM_debug.phase_w_filtered,
-                                             RMM_debug.phase_w_instant);
-                } else {
-                    phase_line += "NA inst=NA";
-                }
-                if (RMM_debug.direction_reversal)
-                    phase_line += "  DIRECTION_REVERSAL";
-                if (RMM_debug.phase_w_applied)
-                    phase_line += "  W_FUSED";
+                std::string association_line =
+                    "SP association: nearest 3 by range, min(angle+bearing)";
+                if (RMM_debug.armor_switched)
+                    association_line += "  SWITCH";
                 cv::putText(
-                    RMM_visualize_frame, phase_line,
+                    RMM_visualize_frame, association_line,
                     cv::Point(14, 121), cv::FONT_HERSHEY_SIMPLEX, 0.50,
-                    RMM_debug.direction_reversal
-                        ? cv::Scalar(0, 0, 200)
-                        : cv::Scalar(90, 70, 20),
+                    cv::Scalar(90, 70, 20),
                     1, cv::LINE_AA);
 
                 const int baseline = kVerticalHeight - 40;
@@ -896,7 +902,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
                 }
 
                 // -------------------------------------------------------------
-                // Real camera overlay: same robust-EKF geometry as the standalone
+                // Real camera overlay: same SuperPower-EKF geometry as the standalone
                 // replay, projected back through RestFrame + calibrated camera.
                 // No legacy-RMM/fire-control debug primitives are drawn here.
                 // Current E0-E3 come from predict(0); AIM is the selected future
@@ -1017,7 +1023,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
                     EKF_camera_overlay_frame;
             }
         }
-        // ========================== Robust EKF =========================== END
+        // ======================== SuperPower EKF ======================== END
     }
 
     drawYawMeasurementPanel(frame, result.yaw_debug);

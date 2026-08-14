@@ -41,6 +41,7 @@
 #include "visualizer/YawVisualizer.h"
 #include "logger/TwoVideoLogger.h"
 #include "RP24_YOLO/RP24_YOLO_Wrapper.h"
+#include "EKF/EKFDebugPlotter.h"
 
 namespace fs = std::filesystem;
 
@@ -84,6 +85,8 @@ public:
 
         // 加载配置文件
         config_file_ptr = std::make_shared<YAML::Node>(YAML::LoadFile(config_file_path));
+        ekf_debug_plotter_ = std::make_unique<EKFDebugPlotter>(
+            EKFDebugPlotConfig::fromYaml(*config_file_ptr));
 
         const YAML::Node yaw_debug_config =
             (*config_file_ptr)["yaw_refinement"];
@@ -104,6 +107,64 @@ public:
                 yaw_debug_csv_enabled_ = false;
                 RCLCPP_ERROR(this->get_logger(),
                              "Failed to open yaw debug CSV");
+            }
+        }
+
+        const YAML::Node pnp_debug_config =
+            (*config_file_ptr)["pnp_diagnostic"];
+        pnp_debug_csv_enabled_ =
+            pnp_debug_config["csv_enabled"].as<bool>();
+        calibration_resolution_known_ =
+            pnp_debug_config["calibration_resolution_known"].as<bool>();
+        calibration_width_ = pnp_debug_config["calibration_width"].as<int>();
+        calibration_height_ = pnp_debug_config["calibration_height"].as<int>();
+        detector_input_width_ =
+            pnp_debug_config["detector_input_width"].as<int>();
+        detector_input_height_ =
+            pnp_debug_config["detector_input_height"].as<int>();
+        if (pnp_debug_csv_enabled_) {
+            pnp_debug_csv_.open(
+                pnp_debug_config["csv_path"].as<std::string>(),
+                std::ios::out | std::ios::trunc);
+            if (pnp_debug_csv_) {
+                pnp_debug_csv_ << std::unitbuf;
+                pnp_debug_csv_
+                    << "frame_id,timestamp_s,detection_index,armor_number,is_large,"
+                       "is_tracked_now,frame_width,frame_height,"
+                       "calibration_resolution_known,calibration_width,"
+                       "calibration_height,detector_input_width,"
+                       "detector_input_height,detector_scale_x,detector_scale_y,"
+                       "current_corner_length_scale,object_width_mm,object_height_mm";
+                for (const char* corner_space : {"raw", "current"}) {
+                    for (int corner = 0; corner < 4; ++corner) {
+                        pnp_debug_csv_ << ',' << corner_space << "_c" << corner << "_x_px"
+                                       << ',' << corner_space << "_c" << corner << "_y_px";
+                    }
+                }
+                const auto write_pose_header = [this](const std::string& prefix) {
+                    pnp_debug_csv_
+                        << ',' << prefix << "_valid"
+                        << ',' << prefix << "_camera_x_m"
+                        << ',' << prefix << "_camera_y_m"
+                        << ',' << prefix << "_camera_z_m"
+                        << ',' << prefix << "_world_x_m"
+                        << ',' << prefix << "_world_y_m"
+                        << ',' << prefix << "_world_z_m"
+                        << ',' << prefix << "_range_m"
+                        << ',' << prefix << "_reprojection_rmse_px"
+                        << ',' << prefix << "_world_yaw_rad"
+                        << ',' << prefix << "_facing_angle_rad";
+                };
+                write_pose_header("raw");
+                write_pose_header("current");
+                for (const char* scale : {"s090", "s095", "s100", "s105", "s110"}) {
+                    write_pose_header(scale);
+                }
+                pnp_debug_csv_ << '\n';
+            } else {
+                pnp_debug_csv_enabled_ = false;
+                RCLCPP_ERROR(this->get_logger(),
+                             "Failed to open PnP diagnostic CSV");
             }
         }
 
@@ -164,6 +225,9 @@ public:
                        "hypothetical_scaled_nis,hypothetical_scaled_nis_x,"
                        "hypothetical_scaled_nis_y,hypothetical_scaled_nis_z,"
                        "hypothetical_scaled_nis_yaw,"
+                       "fixed_radius_cov_nis,fixed_radius_cov_nis_x,"
+                       "fixed_radius_cov_nis_y,fixed_radius_cov_nis_z,"
+                       "fixed_radius_cov_nis_yaw,"
                        "nis_gate_pass,position_gate_pass,yaw_gate_pass,"
                        "passes_all_measurement_gates,radial_residual_m,"
                        "tangential_residual_m,updated\n";
@@ -763,6 +827,81 @@ private:
                        << (debug.armor_switched ? 1 : 0) << '\n';
     }
 
+    void writePnpDebugCsv(
+        std::uint64_t frame_id,
+        double timestamp_s,
+        std::size_t detection_index,
+        const ArmorResult& armor_result,
+        const AimResult& solve_result,
+        int frame_width,
+        int frame_height) {
+        if (!pnp_debug_csv_enabled_ || !pnp_debug_csv_ ||
+            !solve_result.pnp_diagnostic.available) {
+            return;
+        }
+        const PnPDiagnostic& diagnostic = solve_result.pnp_diagnostic;
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        pnp_debug_csv_ << frame_id << ',' << std::setprecision(12)
+                       << timestamp_s << ',' << detection_index << ','
+                       << armor_result.number << ','
+                       << (armor_result.is_large ? 1 : 0) << ','
+                       << (armor_result.is_tracked_now ? 1 : 0) << ','
+                       << frame_width << ',' << frame_height << ','
+                       << (calibration_resolution_known_ ? 1 : 0) << ','
+                       << calibration_width_ << ',' << calibration_height_ << ','
+                       << detector_input_width_ << ',' << detector_input_height_ << ','
+                       << static_cast<double>(frame_width) /
+                              std::max(1, detector_input_width_) << ','
+                       << static_cast<double>(frame_height) /
+                              std::max(1, detector_input_height_) << ','
+                       << diagnostic.current_corner_length_scale << ','
+                       << diagnostic.object_width_mm << ','
+                       << diagnostic.object_height_mm;
+
+        const auto write_corners = [this, nan](
+            const std::vector<cv::Point2f>& corners) {
+            for (int index = 0; index < 4; ++index) {
+                if (index < static_cast<int>(corners.size())) {
+                    pnp_debug_csv_ << ',' << corners[index].x
+                                   << ',' << corners[index].y;
+                } else {
+                    pnp_debug_csv_ << ',' << nan << ',' << nan;
+                }
+            }
+        };
+        write_corners(armor_result.armor.raw_detector_corners);
+        write_corners(armor_result.armor.light_bar_corners);
+
+        const auto write_pose = [this, nan](const PnPDiagnosticPose& pose) {
+            cv::Point3f world_position(
+                static_cast<float>(nan),
+                static_cast<float>(nan),
+                static_cast<float>(nan));
+            if (pose.valid) {
+                world_position =
+                    rest_frame_->pnpToWorldP3f(pose.muzzle_position_mm);
+            }
+            pnp_debug_csv_
+                << ',' << (pose.valid ? 1 : 0)
+                << ',' << (pose.valid ? pose.camera_position_mm.x / 1000.0 : nan)
+                << ',' << (pose.valid ? pose.camera_position_mm.y / 1000.0 : nan)
+                << ',' << (pose.valid ? pose.camera_position_mm.z / 1000.0 : nan)
+                << ',' << (pose.valid ? world_position.x / 1000.0 : nan)
+                << ',' << (pose.valid ? world_position.y / 1000.0 : nan)
+                << ',' << (pose.valid ? world_position.z / 1000.0 : nan)
+                << ',' << (pose.valid ? pose.range_mm / 1000.0 : nan)
+                << ',' << (pose.valid ? pose.reprojection_rmse_px : nan)
+                << ',' << (pose.valid ? pose.world_yaw_rad : nan)
+                << ',' << (pose.valid ? pose.facing_angle_rad : nan);
+        };
+        write_pose(diagnostic.raw_detector_corners);
+        write_pose(diagnostic.current_corrected_corners);
+        for (const PnPScaleDiagnostic& scale : diagnostic.object_scale_sweep) {
+            write_pose(scale.pose);
+        }
+        pnp_debug_csv_ << '\n';
+    }
+
     void writeGeometryDebugCsv(
         std::uint64_t frame_id,
         double timestamp_s,
@@ -835,6 +974,8 @@ private:
                 hypothesis.measurement;
             const rm_ekf::AssociationCandidate& hypothetical =
                 hypothesis.hypothetical_scaled_yaw_measurement;
+            const rm_ekf::AssociationCandidate& fixed_radius_covariance =
+                hypothesis.statistically_fixed_radius_measurement;
             association_debug_csv_ << frame_id << ',' << std::setprecision(12)
                 << timestamp_s << ',' << target_name << ','
                 << debug.target_state << ',' << debug.ekf_state << ','
@@ -885,6 +1026,11 @@ private:
                 << hypothetical.nis_contribution(1) << ','
                 << hypothetical.nis_contribution(2) << ','
                 << hypothetical.nis_contribution(3) << ','
+                << fixed_radius_covariance.nis << ','
+                << fixed_radius_covariance.nis_contribution(0) << ','
+                << fixed_radius_covariance.nis_contribution(1) << ','
+                << fixed_radius_covariance.nis_contribution(2) << ','
+                << fixed_radius_covariance.nis_contribution(3) << ','
                 << (hypothesis.nis_gate_pass ? 1 : 0) << ','
                 << (hypothesis.position_gate_pass ? 1 : 0) << ','
                 << (hypothesis.yaw_gate_pass ? 1 : 0) << ','
@@ -922,6 +1068,85 @@ private:
             << (debug.available ? debug.nis
                                 : std::numeric_limits<double>::quiet_NaN())
             << '\n';
+    }
+
+    void updateEKFDebugPlot(
+        std::uint64_t frame_id,
+        double timestamp_s,
+        const PredictorResult& predictor_result) {
+        if (!ekf_debug_plotter_ || !ekf_debug_plotter_->active() ||
+            !predictor_result.geometry_debug.available) {
+            return;
+        }
+        const GeometryDebug& d = predictor_result.geometry_debug;
+        EKFDebugPlotSample s;
+        s.frame_id = frame_id;
+        s.timestamp_s = timestamp_s;
+        s.measurement_x = d.measurement(0);
+        s.measurement_y = d.measurement(1);
+        s.measurement_z = d.measurement(2);
+        s.measurement_yaw = d.measurement(3);
+        s.matched_id = d.matched_armor_id;
+        s.pre_pred_x = d.pre_predicted(0);
+        s.pre_pred_y = d.pre_predicted(1);
+        s.pre_pred_z = d.pre_predicted(2);
+        s.pre_pred_yaw = d.pre_predicted(3);
+        s.post_pred_x = d.post_predicted(0);
+        s.post_pred_y = d.post_predicted(1);
+        s.post_pred_z = d.post_predicted(2);
+        s.post_pred_yaw = d.post_predicted(3);
+        s.pre_dx = d.pre_residual(0);
+        s.pre_dy = d.pre_residual(1);
+        s.pre_dz = d.pre_residual(2);
+        s.pre_position_error = d.pre_position_error;
+        s.post_dx = d.post_residual(0);
+        s.post_dy = d.post_residual(1);
+        s.post_dz = d.post_residual(2);
+        s.post_position_error = d.post_position_error;
+        s.residual_radial = d.residual_radial;
+        s.residual_tangential = d.residual_tangential;
+        s.center_x = d.center_x_m;
+        s.center_y = d.center_y_m;
+        s.center_z = d.center_z_m;
+        s.vx = d.vx_m_s;
+        s.vy = d.vy_m_s;
+        s.vz = d.vz_m_s;
+        s.yaw = d.state_yaw_rad;
+        s.w = d.w_rad_s;
+        s.phase_w = d.phase_w_filtered;
+        s.instant_phase_w = d.phase_w_instant;
+        s.phase_valid = d.phase_observer_valid;
+        if (!s.phase_valid) s.instant_phase_w =
+            std::numeric_limits<double>::quiet_NaN();
+        s.r1 = d.r1_m;
+        s.r2 = d.r2_m;
+        s.h = d.h_m;
+        s.p_x = d.p_x_m2;
+        s.p_vx = d.p_vx_m2_s2;
+        s.p_y = d.p_y_m2;
+        s.p_vy = d.p_vy_m2_s2;
+        s.p_r1 = d.p_r1_m2;
+        s.p_r2 = d.p_r2_m2;
+        s.p_h = d.p_h_m2;
+        s.nis = d.nis;
+        s.nis_xyz = d.nis_xyz;
+        s.nis_yaw = d.nis_yaw;
+        s.yaw_variance_scale = d.yaw_variance_scale;
+        s.tracker_state = d.ekf_state;
+        s.armor_switch = d.armor_switched;
+        s.direction_reversal = d.direction_reversal;
+        s.pending_sign_conflict = d.pending_sign_conflict;
+        s.association_success = d.updated;
+        ekf_debug_plotter_->update(std::move(s));
+
+        if (ekf_debug_plotter_->windowEnabled()) {
+            cv::Mat curves = ekf_debug_plotter_->render();
+            cv::imshow("EKF Debug Curves", curves);
+            if (ekf_debug_plotter_->saveLatestPng() && frame_id % 30 == 0) {
+                cv::imwrite(ekf_debug_plotter_->screenshotPath(), curves);
+            }
+            cv::waitKey(1);
+        }
     }
 
     void processImage() {
@@ -1028,10 +1253,16 @@ private:
             }
 
             std::vector<ArmorResult> classifyResults_withSolveArmorResult;
+            std::size_t pnp_detection_index = 0;
             for (ArmorResult &classify_result : classifyResults) {
                 AimResult solve_armor_result = armor_solver_->solveArmor(
                     classify_result, last_pitch_rad_delayed_,
                     last_yaw_rad_delayed_, last_roll_rad_delayed_);
+                writePnpDebugCsv(
+                    frame_id, frame_timestamp_s, pnp_detection_index,
+                    classify_result, solve_armor_result,
+                    frame.cols, frame.rows);
+                ++pnp_detection_index;
                 cv::Point3f rest_frame_pos = rest_frame_ -> pnpToWorldP3f(solve_armor_result.position);
                 if (rest_frame_pos.z < max_armor_position_height && solve_armor_result.valid) { // 高度高于一定值视为无效
                     classifyResults_withSolveArmorResult.emplace_back(classify_result);
@@ -1089,6 +1320,7 @@ private:
                                      predictor_result, target_status);
             writeLifecycleDebugCsv(frame_id, frame_timestamp_s,
                                    predictor_result, target_status);
+            updateEKFDebugPlot(frame_id, frame_timestamp_s, predictor_result);
             const std::string aiming_text = target_status.target_type.has_value()
                 ? "aiming " + ArmorType::ArmorTypeStrings[*target_status.target_type] +
                     ": " + ((*target_status.target_type == ArmorType::Outpost ||
@@ -1279,12 +1511,20 @@ private:
 
     bool yaw_debug_csv_enabled_ = false;
     std::ofstream yaw_debug_csv_;
+    bool pnp_debug_csv_enabled_ = false;
+    std::ofstream pnp_debug_csv_;
+    bool calibration_resolution_known_ = false;
+    int calibration_width_ = 0;
+    int calibration_height_ = 0;
+    int detector_input_width_ = 640;
+    int detector_input_height_ = 640;
     bool geometry_debug_csv_enabled_ = false;
     std::ofstream geometry_debug_csv_;
     bool association_debug_csv_enabled_ = false;
     std::ofstream association_debug_csv_;
     bool lifecycle_debug_csv_enabled_ = false;
     std::ofstream lifecycle_debug_csv_;
+    std::unique_ptr<EKFDebugPlotter> ekf_debug_plotter_;
 };
 
 std::shared_ptr<ArmorDetectNode> node;

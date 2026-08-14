@@ -335,12 +335,112 @@ AimResult ArmorSolver::solveArmor(const ArmorResult& armor_result,
             cv::Point3f(half_width, -half_height, 0.0f)
         };
 
+        const auto diagnostic_pose_from_solution =
+            [&](const std::vector<cv::Point3f>& object_points,
+                const std::vector<cv::Point2f>& image_points,
+                const cv::Mat& diagnostic_rvec,
+                const cv::Mat& diagnostic_tvec) {
+                PnPDiagnosticPose pose;
+                if (object_points.size() != 4 || image_points.size() != 4 ||
+                    diagnostic_rvec.empty() || diagnostic_tvec.empty()) {
+                    return pose;
+                }
+                pose.valid = true;
+                pose.camera_position_mm = cv::Point3f(
+                    diagnostic_tvec.at<double>(0),
+                    diagnostic_tvec.at<double>(1),
+                    diagnostic_tvec.at<double>(2));
+                pose.muzzle_position_mm = pose.camera_position_mm;
+                pose.muzzle_position_mm.x += delta_x_;
+                pose.muzzle_position_mm.y -= delta_z_;
+                pose.muzzle_position_mm.z += delta_y_;
+                pose.range_mm = cv::norm(pose.camera_position_mm);
+                pose.reprojection_rmse_px = reprojectionRmse(
+                    object_points, image_points, diagnostic_rvec,
+                    diagnostic_tvec, camera_matrix, dist_coeffs);
+
+                cv::Mat diagnostic_rmat;
+                cv::Rodrigues(diagnostic_rvec, diagnostic_rmat);
+                const Eigen::Matrix3d R = fyt::utils::cvToEigen(diagnostic_rmat);
+                const Eigen::Matrix3d R_camera_armor =
+                    kCvToNormal * R * kCvToNormal.transpose();
+                const Eigen::Matrix3d R_world_armor =
+                    R_world_camera * R_camera_armor;
+                double yaw = 0.0, pitch = 0.0, roll = 0.0;
+                normalYprFromRotation(R_world_armor, yaw, pitch, roll);
+                if (std::isfinite(yaw)) pose.world_yaw_rad = wrapToPi(yaw);
+
+                const Eigen::Vector3d normal_camera =
+                    R * Eigen::Vector3d(0.0, 0.0, -1.0);
+                const Eigen::Vector3d t = fyt::utils::cvToEigen(diagnostic_tvec);
+                if (normal_camera.allFinite() && t.allFinite() && t.norm() > 1e-9) {
+                    const double abs_cos = std::clamp(
+                        std::abs(normal_camera.normalized().dot(t.normalized())),
+                        0.0, 1.0);
+                    pose.facing_angle_rad = std::acos(abs_cos);
+                }
+                return pose;
+            };
+
+        const auto solve_diagnostic_pose =
+            [&](const std::vector<cv::Point3f>& object_points,
+                const std::vector<cv::Point2f>& image_points) {
+                PnPDiagnosticPose pose;
+                if (object_points.size() != 4 || image_points.size() != 4) {
+                    return pose;
+                }
+                cv::Mat diagnostic_rvec, diagnostic_tvec;
+                if (!cv::solvePnP(object_points, image_points,
+                                  camera_matrix, dist_coeffs,
+                                  diagnostic_rvec, diagnostic_tvec,
+                                  false, cv::SOLVEPNP_IPPE)) {
+                    return pose;
+                }
+                return diagnostic_pose_from_solution(
+                    object_points, image_points,
+                    diagnostic_rvec, diagnostic_tvec);
+            };
+
         cv::Mat rvec, tvec;
         bool solve_success = cv::solvePnP(armor_points_3d, armor_result.armor.light_bar_corners, // armor_result.corners, 
                                         camera_matrix, dist_coeffs, 
                                         rvec, tvec, false, cv::SOLVEPNP_IPPE);
 
         if (solve_success) {
+
+            if (pnp_diagnostic_enabled_) {
+                result.pnp_diagnostic.available = true;
+                result.pnp_diagnostic.current_corner_length_scale =
+                    armor_result.armor.raw_to_current_light_length_scale;
+                result.pnp_diagnostic.object_width_mm = 2.0 * half_width;
+                result.pnp_diagnostic.object_height_mm = 2.0 * half_height;
+                result.pnp_diagnostic.current_corrected_corners =
+                    diagnostic_pose_from_solution(
+                        armor_points_3d, armor_result.armor.light_bar_corners,
+                        rvec, tvec);
+                result.pnp_diagnostic.raw_detector_corners =
+                    solve_diagnostic_pose(
+                        armor_points_3d,
+                        armor_result.armor.raw_detector_corners);
+                constexpr std::array<double, 5> kObjectScales =
+                    {0.90, 0.95, 1.00, 1.05, 1.10};
+                for (std::size_t scale_index = 0;
+                     scale_index < kObjectScales.size(); ++scale_index) {
+                    const double scale = kObjectScales[scale_index];
+                    auto& diagnostic =
+                        result.pnp_diagnostic.object_scale_sweep[scale_index];
+                    diagnostic.object_scale = scale;
+                    if (std::abs(scale - 1.0) < 1e-12) {
+                        diagnostic.pose =
+                            result.pnp_diagnostic.current_corrected_corners;
+                        continue;
+                    }
+                    std::vector<cv::Point3f> scaled_points = armor_points_3d;
+                    for (cv::Point3f& point : scaled_points) point *= scale;
+                    diagnostic.pose = solve_diagnostic_pose(
+                        scaled_points, armor_result.armor.light_bar_corners);
+                }
+            }
 
             RCLCPP_DEBUG(logger_p, "solvePnP success");
 

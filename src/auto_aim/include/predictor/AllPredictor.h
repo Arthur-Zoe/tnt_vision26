@@ -66,6 +66,9 @@ struct GeometryDebug {
     double center_x_m = std::numeric_limits<double>::quiet_NaN();
     double center_y_m = std::numeric_limits<double>::quiet_NaN();
     double center_z_m = std::numeric_limits<double>::quiet_NaN();
+    double vx_m_s = std::numeric_limits<double>::quiet_NaN();
+    double vy_m_s = std::numeric_limits<double>::quiet_NaN();
+    double vz_m_s = std::numeric_limits<double>::quiet_NaN();
     double state_yaw_rad = std::numeric_limits<double>::quiet_NaN();
     double w_rad_s = std::numeric_limits<double>::quiet_NaN();
     double nis = std::numeric_limits<double>::quiet_NaN();
@@ -81,10 +84,31 @@ struct GeometryDebug {
     bool phase_observer_valid = false;
     double phase_delta = 0.0;
     double phase_w_filtered = 0.0;
+    double phase_w_instant = 0.0;
     int best_id = -1;
     double measurement_yaw = std::numeric_limits<double>::quiet_NaN();
     double predicted_yaw = std::numeric_limits<double>::quiet_NaN();
     double yaw_innovation = std::numeric_limits<double>::quiet_NaN();
+    Eigen::Matrix<double, 4, 1> measurement =
+        Eigen::Matrix<double, 4, 1>::Constant(
+            std::numeric_limits<double>::quiet_NaN());
+    Eigen::Matrix<double, 4, 1> pre_predicted = measurement;
+    Eigen::Matrix<double, 4, 1> post_predicted = measurement;
+    Eigen::Matrix<double, 3, 1> pre_residual =
+        Eigen::Matrix<double, 3, 1>::Constant(
+            std::numeric_limits<double>::quiet_NaN());
+    Eigen::Matrix<double, 3, 1> post_residual = pre_residual;
+    double pre_position_error = std::numeric_limits<double>::quiet_NaN();
+    double post_position_error = std::numeric_limits<double>::quiet_NaN();
+    double residual_radial = std::numeric_limits<double>::quiet_NaN();
+    double residual_tangential = std::numeric_limits<double>::quiet_NaN();
+    double nis_xyz = std::numeric_limits<double>::quiet_NaN();
+    double nis_yaw = std::numeric_limits<double>::quiet_NaN();
+    double yaw_variance_scale = 1.0;
+    double p_x_m2 = std::numeric_limits<double>::quiet_NaN();
+    double p_vx_m2_s2 = std::numeric_limits<double>::quiet_NaN();
+    double p_y_m2 = std::numeric_limits<double>::quiet_NaN();
+    double p_vy_m2_s2 = std::numeric_limits<double>::quiet_NaN();
     double hypothetical_scaled_nis = std::numeric_limits<double>::quiet_NaN();
     Eigen::Matrix<double, 4, 1> hypothetical_scaled_nis_contribution =
         Eigen::Matrix<double, 4, 1>::Constant(
@@ -117,9 +141,9 @@ struct PredictorResult {
     GeometryDebug geometry_debug;
 
     struct {
-        cv::Mat RMM_visualize_frame;   // robust-EKF top view (legacy name kept for logger compatibility)
-        cv::Mat EKF_vertical_frame;     // robust-EKF y-z view
-        cv::Mat EKF_camera_overlay_frame; // real camera image + robust-EKF overlay only
+        cv::Mat RMM_visualize_frame;   // SuperPower-EKF top view (legacy field name kept)
+        cv::Mat EKF_vertical_frame;     // SuperPower-EKF y-z view
+        cv::Mat EKF_camera_overlay_frame; // real camera image + SuperPower-EKF overlay
         cv::Mat common_debug_oscilloscope_frame;
     } info_images;
 };
@@ -217,7 +241,7 @@ private:
 
     bool has_valid_ballistic = false;
     
-    float init_r = 250.0;
+    float init_r = 200.0;  // mm; SuperPower normal four-armor initialization
 
     struct EKF_fire_control_data_t {
         int after_target_change_ceasefire_ms;

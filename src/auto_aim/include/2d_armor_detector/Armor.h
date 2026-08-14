@@ -7,6 +7,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <yaml-cpp/yaml.h>
 #include <opencv2/opencv.hpp>
+#include <array>
 #include <limits>
 #include <string>
 
@@ -48,6 +49,31 @@ namespace ArmorConstants {
     constexpr float LARGE_ARMOR_LIGHT_DISTANCE = 225.0f; // 待修正
 }
 
+struct PnPDiagnosticPose {
+    bool valid = false;
+    cv::Point3f camera_position_mm;
+    cv::Point3f muzzle_position_mm;
+    double range_mm = std::numeric_limits<double>::quiet_NaN();
+    double reprojection_rmse_px = std::numeric_limits<double>::quiet_NaN();
+    double world_yaw_rad = std::numeric_limits<double>::quiet_NaN();
+    double facing_angle_rad = std::numeric_limits<double>::quiet_NaN();
+};
+
+struct PnPScaleDiagnostic {
+    double object_scale = 1.0;
+    PnPDiagnosticPose pose;
+};
+
+struct PnPDiagnostic {
+    bool available = false;
+    double current_corner_length_scale = 1.0;
+    double object_width_mm = std::numeric_limits<double>::quiet_NaN();
+    double object_height_mm = std::numeric_limits<double>::quiet_NaN();
+    PnPDiagnosticPose raw_detector_corners;
+    PnPDiagnosticPose current_corrected_corners;
+    std::array<PnPScaleDiagnostic, 5> object_scale_sweep;
+};
+
 struct AimResult {
     cv::Point3f position;  // 装甲板中心在枪口坐标系下的位置
     double distance;       // 距离
@@ -72,6 +98,7 @@ struct AimResult {
     std::vector<double> normal_euler_angles; // RestFrame中定义的坐标系下的欧拉角
 
     std::vector<double> ba_global_ypr;
+    PnPDiagnostic pnp_diagnostic;
 };
 
 struct Armor {
@@ -116,6 +143,10 @@ struct Armor {
     cv::Point2f computeIntersection(const std::vector<cv::Point2f>& corners);
 
     std::vector<cv::Point2f> light_bar_corners;
+    // Direct detector keypoints in original-frame pixel coordinates. The
+    // formal PnP path remains light_bar_corners; this is diagnostic-only.
+    std::vector<cv::Point2f> raw_detector_corners;
+    float raw_to_current_light_length_scale = 1.0f;
 
     bool is_true_yolo_armor(cv::Mat& frame);
 };

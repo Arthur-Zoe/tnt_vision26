@@ -1,37 +1,54 @@
 #include "EKF/EKFTargetPredictor.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
-#include <optional>
 
 namespace {
 constexpr double kMillimetersPerMeter = 1000.0;
+constexpr double kPi = 3.141592653589793238462643383279502884;
+constexpr double kHalfPi = kPi / 2.0;
 }
 
 EKFTargetPredictor::EKFTargetPredictor(
     const EKFTargetObservation& initial_observation,
     double initial_radius_mm,
     std::shared_ptr<YAML::Node> config_file_ptr) {
+    // Do not inherit any old RobustArmorTracker tuning. These defaults are
+    // SuperPower standard3 + the normal four-armor Tracker::set_target branch.
+    config_.min_detect_count = 5;
+    config_.max_temp_lost_count = 15;
+    config_.max_dt_s = 0.1;
+    config_.initial_radius_m = 0.2;
+    config_.armor_num = 4;
+
+    // The YAML block is deliberately a transcription of those SP constants.
+    // Reading it here keeps one visible source of truth without consulting the
+    // legacy robust_ekf block.
     if (config_file_ptr) {
-        config_ = rm_ekf::RobustTrackerConfig::fromYaml(
-            *config_file_ptr, initial_radius_mm / kMillimetersPerMeter);
-        const YAML::Node reset_time_node = (*config_file_ptr)["reset_predictor_time"];
-        if (reset_time_node) {
-            const double reset_time_ms = reset_time_node.as<double>();
-            if (std::isfinite(reset_time_ms) && reset_time_ms > 0.0) {
-                max_tracking_gap_s_ = reset_time_ms / 1000.0;
-            }
+        const YAML::Node sp = (*config_file_ptr)["superpower_ekf"];
+        if (sp) {
+            if (sp["min_detect_count"])
+                config_.min_detect_count = sp["min_detect_count"].as<int>();
+            if (sp["max_temp_lost_count"])
+                config_.max_temp_lost_count = sp["max_temp_lost_count"].as<int>();
+            if (sp["max_dt_s"])
+                config_.max_dt_s = sp["max_dt_s"].as<double>();
+            if (sp["initial_radius_m"])
+                config_.initial_radius_m = sp["initial_radius_m"].as<double>();
+            if (sp["armor_num"])
+                config_.armor_num = sp["armor_num"].as<int>();
         }
-    } else {
-        config_.initial_filter.r1 = initial_radius_mm / kMillimetersPerMeter;
-        config_.initial_filter.r2 = initial_radius_mm / kMillimetersPerMeter;
-        config_.initial_filter.h = 0.0;
     }
 
+    // Keep the old constructor ABI. SP's normal branch initializes at 0.2 m,
+    // so the previous caller-provided RMM radius must not alter the baseline.
+    (void)initial_radius_mm;
+
+    resetTracker();
     if (std::isfinite(initial_observation.t)) {
         initializeFromObservation(initial_observation);
     } else {
-        resetTracker();
         last_dt_s_ = initial_observation.t;
         warnTimeIssue("non-finite timestamp", initial_observation.t,
                       initial_observation.t);
@@ -62,21 +79,25 @@ void EKFTargetPredictor::update(const EKFTargetObservation& observation) {
         warnTimeIssue("duplicate/out-of-order timestamp", observation.t, dt);
         return;
     }
-    if (dt > max_tracking_gap_s_) {
-        warnTimeIssue("tracking time discontinuity", observation.t, dt);
+
+    // Do not pre-reset at the old RMM reset_predictor_time.  The SP tracker
+    // itself applies its original 0.1 s large-dt reset behavior.
+    if (dt > config_.max_dt_s) {
         time_discontinuity_ = true;
-        initializeFromObservation(observation);
-        return;
     }
 
-    last_result_ = tracker_->process(toMeters(observation), dt, -1);
+    last_observation_ = toSuperPower(observation);
+    last_result_ = tracker_->process(last_observation_, dt);
     last_update_time_ = observation.t;
     timestamp_warning_active_ = false;
-    if (last_result_.updated || last_result_.initialized_this_frame) {
+
+    if (last_result_.initialized_this_frame) {
+        update_frames_ = 1;
+    } else if (last_result_.updated) {
         ++update_frames_;
     }
-    if (tracker_->currentArmorId() >= 0) {
-        debug_flip_flag_ = (tracker_->currentArmorId() % 2) + 1;
+    if (last_result_.matched_id >= 0) {
+        debug_flip_flag_ = (last_result_.matched_id % 2) + 1;
     }
 }
 
@@ -106,83 +127,99 @@ void EKFTargetPredictor::missUpdate(double update_time) {
         warnTimeIssue("duplicate/out-of-order timestamp", update_time, dt);
         return;
     }
-    if (dt > max_tracking_gap_s_) {
-        warnTimeIssue("tracking time discontinuity", update_time, dt);
-        resetTracker();
-        last_update_time_ = update_time;
-        has_update_time_ = true;
+
+    if (dt > config_.max_dt_s) {
         time_discontinuity_ = true;
-        return;
     }
 
-    last_result_ = tracker_->process(std::nullopt, dt, -1);
+    last_observation_.reset();
+    last_result_ = tracker_->process(std::nullopt, dt);
     last_update_time_ = update_time;
     timestamp_warning_active_ = false;
-    if (tracker_->currentArmorId() >= 0) {
-        debug_flip_flag_ = (tracker_->currentArmorId() % 2) + 1;
-    }
 }
 
 void EKFTargetPredictor::clear() {
-    if (tracker_) tracker_->clear();
-    last_result_ = rm_ekf::TrackerResult{};
+    resetTracker();
+    last_observation_.reset();
+    last_update_time_ = 0.0;
+    last_dt_s_ = 0.0;
     update_frames_ = 0;
     debug_flip_flag_ = 1;
     has_update_time_ = false;
+    timestamp_warning_active_ = false;
+    time_discontinuity_ = false;
 }
 
 EKFTargetPrediction EKFTargetPredictor::predict(double predict_time) const {
     EKFTargetPrediction result;
-    if (!tracker_->hasState()) {
-        return result;
-    }
+    if (!hasState()) return result;
 
-    const rm_ekf::ArmorState state = tracker_->state();
-    result.center_x = (state.x + predict_time * state.vx) * kMillimetersPerMeter;
-    result.center_y = (state.y + predict_time * state.vy) * kMillimetersPerMeter;
-    result.center_z = (state.z + predict_time * state.vz) * kMillimetersPerMeter;
-    result.alternate_z =
-        (state.z + state.h + predict_time * state.vz) * kMillimetersPerMeter;
-    result.r1 = state.r1 * kMillimetersPerMeter;
-    result.r2 = state.r2 * kMillimetersPerMeter;
-    result.h = state.h * kMillimetersPerMeter;
-    result.yaw = rm_ekf::wrapAngle(state.yaw + state.w * predict_time);
-    result.w = state.w;
-    result.rotation_direction = state.w >= 0.0 ? 1 : -1;
+    const sp_ekf::Target* target = tracker_->target();
+    if (!target) return result;
 
-    const auto armors = tracker_->predictArmors(predict_time);
-    result.armors.reserve(armors.size());
-    for (const auto& armor : armors) {
-        const double radius = armor.id % 2 == 0 ? state.r1 : state.r2;
+    Eigen::VectorXd x = target->ekfX();
+    x[0] += x[1] * predict_time;
+    x[2] += x[3] * predict_time;
+    x[4] += x[5] * predict_time;
+    x[6] = wrapAngle(x[6] + x[7] * predict_time);
+
+    const double r1 = x[8];
+    const double r2 = x[8] + x[9];
+    const double h = x[10];
+
+    result.center_x = x[0] * kMillimetersPerMeter;
+    result.center_y = x[2] * kMillimetersPerMeter;
+    result.center_z = x[4] * kMillimetersPerMeter;
+    result.alternate_z = (x[4] + h) * kMillimetersPerMeter;
+    result.r1 = r1 * kMillimetersPerMeter;
+    result.r2 = r2 * kMillimetersPerMeter;
+    result.h = h * kMillimetersPerMeter;
+    result.yaw = toProjectYaw(x[6]);
+    result.w = x[7];
+    result.rotation_direction = x[7] >= 0.0 ? 1 : -1;
+
+    const int armor_num = target->armorNum();
+    result.armors.reserve(static_cast<std::size_t>(armor_num));
+    for (int id = 0; id < armor_num; ++id) {
+        const double angle = wrapAngle(
+            x[6] + id * 2.0 * kPi / static_cast<double>(armor_num));
+        const bool use_l_h = armor_num == 4 && (id == 1 || id == 3);
+        const double radius = use_l_h ? r2 : r1;
+        const double armor_x = x[0] - radius * std::cos(angle);
+        const double armor_y = x[2] - radius * std::sin(angle);
+        const double armor_z = use_l_h ? x[4] + h : x[4];
+
         result.armors.push_back(EKFPredictedArmor{
-            armor.x * kMillimetersPerMeter,
-            armor.y * kMillimetersPerMeter,
-            armor.z * kMillimetersPerMeter,
+            armor_x * kMillimetersPerMeter,
+            armor_y * kMillimetersPerMeter,
+            armor_z * kMillimetersPerMeter,
             radius * kMillimetersPerMeter,
-            armor.yaw,
+            toProjectYaw(angle),
         });
     }
+
     return result;
 }
 
 EKFTargetState EKFTargetPredictor::state() const {
     EKFTargetState result;
-    if (!tracker_->hasState()) {
-        return result;
-    }
+    if (!hasState()) return result;
 
-    const rm_ekf::ArmorState state = tracker_->state();
-    result.center_x = state.x * kMillimetersPerMeter;
-    result.center_y = state.y * kMillimetersPerMeter;
-    result.center_z = state.z * kMillimetersPerMeter;
-    result.center_vx = state.vx * kMillimetersPerMeter;
-    result.center_vy = state.vy * kMillimetersPerMeter;
-    result.center_vz = state.vz * kMillimetersPerMeter;
-    result.r1 = state.r1 * kMillimetersPerMeter;
-    result.r2 = state.r2 * kMillimetersPerMeter;
-    result.h = state.h * kMillimetersPerMeter;
-    result.yaw = state.yaw;
-    result.w = state.w;
+    const sp_ekf::Target* target = tracker_->target();
+    if (!target) return result;
+
+    const Eigen::VectorXd x = target->ekfX();
+    result.center_x = x[0] * kMillimetersPerMeter;
+    result.center_vx = x[1] * kMillimetersPerMeter;
+    result.center_y = x[2] * kMillimetersPerMeter;
+    result.center_vy = x[3] * kMillimetersPerMeter;
+    result.center_z = x[4] * kMillimetersPerMeter;
+    result.center_vz = x[5] * kMillimetersPerMeter;
+    result.yaw = toProjectYaw(x[6]);
+    result.w = x[7];
+    result.r1 = x[8] * kMillimetersPerMeter;
+    result.r2 = (x[8] + x[9]) * kMillimetersPerMeter;
+    result.h = x[10] * kMillimetersPerMeter;
     result.update_frames = update_frames_;
     return result;
 }
@@ -191,113 +228,145 @@ EKFTargetDebugState EKFTargetPredictor::debugState() const {
     EKFTargetDebugState debug;
     debug.dt_s = last_dt_s_;
     debug.time_discontinuity = time_discontinuity_;
-    debug.tracker_state = rm_ekf::trackerStateName(last_result_.state);
+    debug.tracker_state = sp_ekf::trackerStateName(last_result_.state);
     debug.tracker_state_before =
-        rm_ekf::trackerStateName(last_result_.tracker_state_before);
+        sp_ekf::trackerStateName(last_result_.state_before);
     debug.matched_id = last_result_.matched_id;
+    debug.current_armor_id = last_result_.matched_id;
+    debug.best_id = last_result_.matched_id;
     debug.measurement_valid = last_result_.measurement_valid;
     debug.updated = last_result_.updated;
     debug.lost_frames = last_result_.lost_frames;
     debug.nis = last_result_.nis;
     debug.position_error_m = last_result_.position_error;
-    debug.yaw_error_deg = last_result_.yaw_error >= 0.0
-                              ? rm_ekf::rad2deg(last_result_.yaw_error)
+    debug.yaw_error_deg = last_result_.angle_error >= 0.0
+                              ? last_result_.angle_error * 180.0 / kPi
                               : -1.0;
-    debug.phase_observer_valid = last_result_.phase_observer_valid;
-    debug.phase_delta = last_result_.phase_delta;
-    debug.phase_w_instant = last_result_.phase_w_instant;
-    debug.phase_w_filtered = last_result_.phase_w_filtered;
-    debug.direction_reversal = last_result_.direction_reversal;
     debug.armor_switched = last_result_.armor_switched;
-    debug.recovered = last_result_.recovered;
-    debug.phase_w_applied = last_result_.phase_w_applied;
-    debug.pending_sign_conflict = last_result_.pending_sign_conflict;
-    debug.temp_lost_recovery = last_result_.temp_lost_recovery;
-    debug.candidate_is_switch = last_result_.candidate_is_switch;
-    debug.topology_event = last_result_.topology_event;
-    debug.best_id = last_result_.best_id;
-    debug.measurement_yaw = last_result_.measurement_yaw;
-    debug.predicted_yaw = last_result_.predicted_yaw;
-    debug.yaw_innovation = last_result_.yaw_innovation;
-    debug.hypothetical_scaled_nis = last_result_.hypothetical_scaled_nis;
-    debug.hypothetical_scaled_nis_contribution =
-        last_result_.hypothetical_scaled_nis_contribution;
-    debug.geometry_update_allowed = last_result_.geometry_update_allowed;
-    debug.geometry_preserved = last_result_.geometry_preserved;
-    debug.current_armor_id = last_result_.current_armor_id;
-    debug.association_hypotheses = last_result_.association_hypotheses;
-    if (tracker_->hasState()) {
-        const rm_ekf::ArmorState geometry = tracker_->state();
-        const std::array<double, 3> variances = tracker_->geometryVariances();
-        debug.r1_m = geometry.r1;
-        debug.r2_m = geometry.r2;
-        debug.h_m = geometry.h;
-        debug.p_r1_m2 = variances[0];
-        debug.p_r2_m2 = variances[1];
-        debug.p_h_m2 = variances[2];
-    } else {
-        const rm_ekf::GeometryMemory& memory = tracker_->geometryMemory();
-        if (memory.valid) {
-            debug.r1_m = memory.r1;
-            debug.r2_m = memory.r2;
-            debug.h_m = memory.h;
-            debug.p_r1_m2 = memory.var_r1;
-            debug.p_r2_m2 = memory.var_r2;
-            debug.p_h_m2 = memory.var_h;
+    debug.candidate_is_switch = last_result_.armor_switched;
+    debug.topology_event = last_result_.armor_switched;
+    debug.geometry_update_allowed = last_result_.updated;
+    debug.geometry_preserved = false;
+    debug.geometry_valid = hasState();
+    debug.armor_parity = last_result_.matched_id >= 0
+                             ? last_result_.matched_id % 2
+                             : -1;
+
+    if (last_observation_) {
+        debug.measurement << last_observation_->xyz[0],
+                             last_observation_->xyz[1],
+                             last_observation_->xyz[2],
+                             toProjectYaw(last_observation_->angle);
+        debug.measurement_yaw = debug.measurement[3];
+    }
+
+    if (last_result_.matched_id >= 0) {
+        debug.pre_predicted << last_result_.predicted_xyza[0],
+                               last_result_.predicted_xyza[1],
+                               last_result_.predicted_xyza[2],
+                               toProjectYaw(last_result_.predicted_xyza[3]);
+        debug.predicted_yaw = debug.pre_predicted[3];
+        if (last_observation_) {
+            debug.pre_residual =
+                last_observation_->xyz - last_result_.predicted_xyza.head<3>();
+            debug.pre_position_error = debug.pre_residual.norm();
+            debug.yaw_innovation = wrapAngle(
+                debug.measurement_yaw - debug.predicted_yaw);
         }
     }
-    debug.geometry_valid = tracker_->geometryMemory().valid;
-    debug.armor_parity = debug.matched_id >= 0
-        ? debug.matched_id % 2 : -1;
+
+    const sp_ekf::Target* target = tracker_->target();
+    if (hasState() && target) {
+        const Eigen::VectorXd x = target->ekfX();
+        const Eigen::MatrixXd& P = target->ekf().P;
+        debug.r1_m = x[8];
+        debug.r2_m = x[8] + x[9];
+        debug.h_m = x[10];
+        debug.p_r1_m2 = P(8, 8);
+        debug.p_r2_m2 = P(8, 8) + P(9, 9) + 2.0 * P(8, 9);
+        debug.p_h_m2 = P(10, 10);
+        debug.p_x_m2 = P(0, 0);
+        debug.p_vx_m2_s2 = P(1, 1);
+        debug.p_y_m2 = P(2, 2);
+        debug.p_vy_m2_s2 = P(3, 3);
+
+        if (last_result_.matched_id >= 0) {
+            const auto armors = target->armorXyzaList();
+            const std::size_t id =
+                static_cast<std::size_t>(last_result_.matched_id);
+            if (id < armors.size()) {
+                const Eigen::Vector4d& post = armors[id];
+                debug.post_predicted << post[0], post[1], post[2],
+                                        toProjectYaw(post[3]);
+                if (last_observation_) {
+                    debug.post_residual = last_observation_->xyz - post.head<3>();
+                    debug.post_position_error = debug.post_residual.norm();
+                }
+            }
+        }
+    }
+
     return debug;
 }
 
 bool EKFTargetPredictor::ready() const {
-    return tracker_->ready();
+    return tracker_ && tracker_->ready();
 }
 
 bool EKFTargetPredictor::hasState() const {
-    return tracker_->hasState();
+    return tracker_ && tracker_->hasState();
 }
 
 void EKFTargetPredictor::warnTimeIssue(const char* reason,
                                        double update_time,
                                        double dt) {
     if (!timestamp_warning_active_) {
-        std::cerr << "[EKFTargetPredictor] warning: " << reason
-                  << "; t=" << update_time << " dt=" << dt
-                  << " s, max_tracking_gap=" << max_tracking_gap_s_ << " s"
+        std::cerr << "[EKFTargetPredictor/SP] warning: " << reason
+                  << "; t=" << update_time << " dt=" << dt << " s"
                   << std::endl;
         timestamp_warning_active_ = true;
     }
 }
 
 void EKFTargetPredictor::resetTracker() {
-    tracker_ = std::make_unique<rm_ekf::RobustArmorTracker>();
-    tracker_->configure(config_);
-    last_result_ = rm_ekf::TrackerResult{};
-    update_frames_ = 0;
-    debug_flip_flag_ = 1;
+    tracker_ = std::make_unique<sp_ekf::Tracker>(config_);
+    last_result_ = sp_ekf::TrackerResult{};
 }
 
 void EKFTargetPredictor::initializeFromObservation(
     const EKFTargetObservation& observation) {
-    resetTracker();
-    last_result_ = tracker_->process(toMeters(observation), 0.0, -1);
+    if (!tracker_) resetTracker();
+    last_observation_ = toSuperPower(observation);
+    last_result_ = tracker_->process(last_observation_, 0.0);
     last_update_time_ = observation.t;
+    last_dt_s_ = 0.0;
     has_update_time_ = true;
-    update_frames_ = 1;
-    if (tracker_->currentArmorId() >= 0) {
-        debug_flip_flag_ = (tracker_->currentArmorId() % 2) + 1;
+    update_frames_ = last_result_.initialized_this_frame ? 1 : 0;
+    if (last_result_.matched_id >= 0) {
+        debug_flip_flag_ = (last_result_.matched_id % 2) + 1;
     }
 }
 
-rm_ekf::ArmorObservation EKFTargetPredictor::toMeters(
+sp_ekf::ArmorObservation EKFTargetPredictor::toSuperPower(
     const EKFTargetObservation& observation) {
-    rm_ekf::ArmorObservation result;
-    result.x = observation.x / kMillimetersPerMeter;
-    result.y = observation.y / kMillimetersPerMeter;
-    result.z = observation.z / kMillimetersPerMeter;
-    result.yaw = observation.yaw;
+    sp_ekf::ArmorObservation result;
+    result.xyz << observation.x / kMillimetersPerMeter,
+                  observation.y / kMillimetersPerMeter,
+                  observation.z / kMillimetersPerMeter;
+
+    // Current project geometry uses p = c + r*[sin(yaw), -cos(yaw)].
+    // SuperPower uses p = c - r*[cos(angle), sin(angle)].
+    // angle = yaw + pi/2 makes the two definitions identical.
+    result.angle = wrapAngle(observation.yaw + kHalfPi);
     return result;
+}
+
+double EKFTargetPredictor::toProjectYaw(double superpower_angle) {
+    return wrapAngle(superpower_angle - kHalfPi);
+}
+
+double EKFTargetPredictor::wrapAngle(double angle) {
+    while (angle > kPi) angle -= 2.0 * kPi;
+    while (angle <= -kPi) angle += 2.0 * kPi;
+    return angle;
 }

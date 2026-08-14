@@ -101,6 +101,12 @@ RobustTrackerConfig RobustTrackerConfig::fromYaml(const YAML::Node& root, double
     const YAML::Node geometry = n["geometry"];
     readIfExists(geometry, "stable_frames_before_update",
                  cfg.geometry_stable_frames_before_update);
+    readIfExists(geometry, "freeze_radius_kalman_rows",
+                 cfg.freeze_radius_kalman_rows);
+    readIfExists(geometry, "statistically_fixed_radius",
+                 cfg.statistically_fixed_radius);
+    readIfExists(geometry, "fixed_radius_variance",
+                 cfg.fixed_radius_variance);
     const YAML::Node reinit_covariance_floor =
         geometry["reinit_covariance_floor"];
     readIfExists(reinit_covariance_floor, "enabled",
@@ -213,6 +219,11 @@ void ArmorEKF::configure(const RobustTrackerConfig& cfg) {
     max_radius_ = cfg.state_max_radius;
     max_abs_h_ = cfg.state_max_abs_h;
     max_abs_w_ = cfg.state_max_abs_w;
+    statistically_fixed_radius_ = cfg.statistically_fixed_radius;
+    fixed_radius_variance_ =
+        std::max(0.0, cfg.fixed_radius_variance);
+    freeze_radius_kalman_rows_ =
+        cfg.freeze_radius_kalman_rows || statistically_fixed_radius_;
 }
 
 void ArmorEKF::reset(const ArmorState& initial_state) {
@@ -226,6 +237,7 @@ void ArmorEKF::reset(const ArmorState& initial_state) {
     P_(8, 8) = 0.02;
     P_(9, 9) = 0.02;
     P_(10, 10) = 0.02;
+    enforceRadiusCovarianceIsolation();
     enforcePhysicalLimits();
     initialized_ = true;
 }
@@ -240,6 +252,15 @@ void ArmorEKF::enforcePhysicalLimits() {
     X_(8) = std::clamp(X_(8), min_radius_, max_radius_);
     X_(9) = std::clamp(X_(9), min_radius_, max_radius_);
     X_(10) = std::clamp(X_(10), -max_abs_h_, max_abs_h_);
+}
+
+void ArmorEKF::enforceRadiusCovarianceIsolation() {
+    if (!statistically_fixed_radius_) return;
+    for (const int radius_index : {8, 9}) {
+        P_.row(radius_index).setZero();
+        P_.col(radius_index).setZero();
+        P_(radius_index, radius_index) = fixed_radius_variance_;
+    }
 }
 
 void ArmorEKF::predict(double dt) {
@@ -281,6 +302,7 @@ void ArmorEKF::predict(double dt) {
     enforcePhysicalLimits();
     P_ = F * P_ * F.transpose() + Q;
     P_ = 0.5 * (P_ + P_.transpose());
+    enforceRadiusCovarianceIsolation();
 }
 
 AssociationCandidate ArmorEKF::evaluateMeasurement(
@@ -310,6 +332,45 @@ AssociationCandidate ArmorEKF::evaluateMeasurement(
     const Eigen::Matrix<double, 4, 1> solved = ldlt.solve(c.innovation);
     if (ldlt.info() != Eigen::Success || !solved.allFinite()) return c;
 
+    c.nis = c.innovation.dot(solved);
+    c.nis_contribution = c.innovation.cwiseProduct(solved);
+    c.numerically_valid = std::isfinite(c.nis) && c.nis >= 0.0;
+    return c;
+}
+
+AssociationCandidate ArmorEKF::evaluateMeasurementWithFixedRadiusCovariance(
+    const Eigen::Matrix<double, 4, 1>& z,
+    int armor_id,
+    double yaw_variance_scale) const {
+    AssociationCandidate c;
+    c.armor_id = ((armor_id % 4) + 4) % 4;
+    c.yaw_variance_scale = std::max(1.0, yaw_variance_scale);
+    if (!initialized_) return c;
+
+    c.predicted = ArmorModel::measurementFunction(X_, c.armor_id);
+    const Eigen::Matrix<double, 4, 11> H =
+        ArmorModel::measurementJacobian(X_, c.armor_id);
+    c.innovation = z - c.predicted;
+    c.innovation(3) = wrapAngle(c.innovation(3));
+    c.position_error = c.innovation.head<3>().norm();
+    c.yaw_error = std::abs(c.innovation(3));
+
+    Eigen::Matrix<double, 11, 11> statistically_fixed_P = P_;
+    for (const int radius_index : {8, 9}) {
+        statistically_fixed_P.row(radius_index).setZero();
+        statistically_fixed_P.col(radius_index).setZero();
+        statistically_fixed_P(radius_index, radius_index) =
+            fixed_radius_variance_;
+    }
+    Eigen::Matrix<double, 4, 4> R_eff = R_;
+    R_eff(3, 3) *= c.yaw_variance_scale;
+    const Eigen::Matrix<double, 4, 4> S =
+        H * statistically_fixed_P * H.transpose() + R_eff;
+    const auto ldlt = S.ldlt();
+    if (ldlt.info() != Eigen::Success) return c;
+
+    const Eigen::Matrix<double, 4, 1> solved = ldlt.solve(c.innovation);
+    if (ldlt.info() != Eigen::Success || !solved.allFinite()) return c;
     c.nis = c.innovation.dot(solved);
     c.nis_contribution = c.innovation.cwiseProduct(solved);
     c.numerically_valid = std::isfinite(c.nis) && c.nis >= 0.0;
@@ -350,11 +411,19 @@ void ArmorEKF::update(const Eigen::Matrix<double, 4, 1>& z,
         K.row(8).setZero();
         K.row(9).setZero();
         K.row(10).setZero();
-    } else if (id % 2 == 0) {
-        K.row(9).setZero();
-        K.row(10).setZero();
     } else {
-        K.row(8).setZero();
+        // G2 diagnostic: freeze the radius state correction rows while keeping
+        // the normal state/covariance update and the ODD-only h update. This is
+        // deliberately not a per-frame state clamp.
+        if (freeze_radius_kalman_rows_) {
+            K.row(8).setZero();
+            K.row(9).setZero();
+        } else if (id % 2 == 0) {
+            K.row(9).setZero();
+        } else {
+            K.row(8).setZero();
+        }
+        if (id % 2 == 0) K.row(10).setZero();
     }
 
     X_ += K * innovation;
@@ -364,6 +433,7 @@ void ArmorEKF::update(const Eigen::Matrix<double, 4, 1>& z,
     const Eigen::Matrix<double, 11, 11> A = I - K * H;
     P_ = A * P_ * A.transpose() + K * R_eff * K.transpose();
     P_ = 0.5 * (P_ + P_.transpose());
+    enforceRadiusCovarianceIsolation();
 }
 
 void ArmorEKF::updateAngularVelocity(double measured_w, double variance) {
@@ -392,6 +462,7 @@ void ArmorEKF::updateAngularVelocity(double measured_w, double variance) {
     const Eigen::Matrix<double, 11, 11> A = I - K * H;
     P_ = A * P_ * A.transpose() + K * variance * K.transpose();
     P_ = 0.5 * (P_ + P_.transpose());
+    enforceRadiusCovarianceIsolation();
 }
 
 std::array<double, 3> ArmorEKF::geometryVariances() const {
@@ -400,6 +471,15 @@ std::array<double, 3> ArmorEKF::geometryVariances() const {
         return {nan, nan, nan};
     }
     return {P_(8, 8), P_(9, 9), P_(10, 10)};
+}
+
+std::array<double, 11> ArmorEKF::stateVariances() const {
+    std::array<double, 11> variances;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    variances.fill(nan);
+    if (!initialized_) return variances;
+    for (int i = 0; i < 11; ++i) variances[i] = P_(i, i);
+    return variances;
 }
 
 void ArmorEKF::setGeometryVariances(double var_r1,
@@ -414,6 +494,7 @@ void ArmorEKF::setGeometryVariances(double var_r1,
     if (std::isfinite(var_r2) && var_r2 >= 0.0) P_(9, 9) = var_r2;
     if (std::isfinite(var_h) && var_h >= 0.0) P_(10, 10) = var_h;
     P_ = 0.5 * (P_ + P_.transpose());
+    enforceRadiusCovarianceIsolation();
 }
 
 const char* trackerStateName(TrackerState state) {
@@ -697,6 +778,9 @@ AssociationCandidate RobustArmorTracker::chooseAssociation(
             debug.hypothetical_scaled_yaw_measurement =
                 ekf_.evaluateMeasurement(
                     z, id, cfg_.rotation_switch_yaw_r_scale);
+            debug.statistically_fixed_radius_measurement =
+                ekf_.evaluateMeasurementWithFixedRadiusCovariance(
+                    z, id, yawScaleForCandidate(id));
             const double sin_yaw = std::sin(armor.yaw);
             const double cos_yaw = std::cos(armor.yaw);
             debug.radial_residual =
@@ -821,6 +905,7 @@ TrackerResult RobustArmorTracker::process(
 
     result.measurement_valid = true;
     const Eigen::Matrix<double, 4, 1> z = measurement->toVector();
+    result.measurement = z;
     result.measurement_yaw = z(3);
 
     if (state_ == TrackerState::LOST || !ekf_.initialized()) {
@@ -871,6 +956,22 @@ TrackerResult RobustArmorTracker::process(
         phase.pending_sign_conflict;
     result.predicted_yaw = chosen.predicted(3);
     result.yaw_innovation = chosen.innovation(3);
+    result.pre_predicted = chosen.predicted;
+    result.pre_residual = chosen.innovation.head<3>();
+    result.pre_position_error = chosen.position_error;
+    result.nis_xyz = chosen.nis_contribution.head<3>().sum();
+    result.nis_yaw = chosen.nis_contribution(3);
+    result.yaw_variance_scale = chosen.yaw_variance_scale;
+    if (chosen.armor_id >= 0) {
+        const double sin_yaw = std::sin(chosen.predicted(3));
+        const double cos_yaw = std::cos(chosen.predicted(3));
+        result.residual_radial =
+            chosen.innovation(0) * sin_yaw -
+            chosen.innovation(1) * cos_yaw;
+        result.residual_tangential =
+            chosen.innovation(0) * cos_yaw +
+            chosen.innovation(1) * sin_yaw;
+    }
     if (cfg_.association_debug_enable && chosen.armor_id >= 0) {
         const AssociationCandidate hypothetical = ekf_.evaluateMeasurement(
             z, chosen.armor_id, cfg_.rotation_switch_yaw_r_scale);
@@ -933,6 +1034,13 @@ TrackerResult RobustArmorTracker::process(
             result.phase_w_applied = true;
         }
     }
+
+    // Re-evaluate the same measurement and matched armor after all corrections.
+    // This is diagnostic only and cannot affect association or filter state.
+    result.post_predicted = ArmorModel::measurementFunction(
+        ekf_.state().toVector(), chosen.armor_id);
+    result.post_residual = z.head<3>() - result.post_predicted.head<3>();
+    result.post_position_error = result.post_residual.norm();
 
     current_armor_id_ = chosen.armor_id;
     lost_frames_ = 0;

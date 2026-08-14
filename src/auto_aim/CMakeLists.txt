@@ -66,8 +66,11 @@ add_library(armor_detector SHARED
     src/other_input/VideoInput.cpp
     src/other_input/ImagesInput.cpp
     src/predictor/PositionPredictor2D.cpp
-    src/EKF/RobustArmorTracker.cpp
+    src/EKF/SuperPowerEKF.cpp
+    src/EKF/SuperPowerTarget.cpp
+    src/EKF/SuperPowerTracker.cpp
     src/EKF/EKFTargetPredictor.cpp
+    src/EKF/EKFDebugPlotter.cpp
     src/predictor/AllPredictor.cpp
     src/predictor/TargetManager.cpp
     src/predictor/PredictorMain.cpp

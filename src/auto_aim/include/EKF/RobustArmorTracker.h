@@ -101,6 +101,9 @@ struct RobustTrackerConfig {
 
     double armor_visible_angle_deg = 70.0;
     int geometry_stable_frames_before_update = 5;
+    bool freeze_radius_kalman_rows = false;
+    bool statistically_fixed_radius = false;
+    double fixed_radius_variance = 1e-8;
     bool geometry_reinit_covariance_floor_enabled = false;
     double geometry_reinit_radius_variance_floor = 0.0;
     double geometry_reinit_height_variance_floor = 0.0;
@@ -133,6 +136,10 @@ struct AssociationHypothesisDebug {
     bool visibility_pass = false;
     AssociationCandidate measurement;
     AssociationCandidate hypothetical_scaled_yaw_measurement;
+    // Diagnostic only: same state/innovation as `measurement`, but with the
+    // radius covariance rows/columns isolated at the configured fixed value.
+    // This candidate must never participate in association or EKF updates.
+    AssociationCandidate statistically_fixed_radius_measurement;
     double radial_residual = std::numeric_limits<double>::quiet_NaN();
     double tangential_residual = std::numeric_limits<double>::quiet_NaN();
     bool nis_gate_pass = false;
@@ -175,11 +182,18 @@ public:
         const Eigen::Matrix<double, 4, 1>& z,
         int armor_id,
         double yaw_variance_scale = 1.0) const;
+    AssociationCandidate evaluateMeasurementWithFixedRadiusCovariance(
+        const Eigen::Matrix<double, 4, 1>& z,
+        int armor_id,
+        double yaw_variance_scale = 1.0) const;
     std::array<double, 3> geometryVariances() const;
+    std::array<double, 11> stateVariances() const;
+    Eigen::Matrix<double, 11, 11> covariance() const { return P_; }
     void setGeometryVariances(double var_r1, double var_r2, double var_h);
 
 private:
     void enforcePhysicalLimits();
+    void enforceRadiusCovarianceIsolation();
 
     bool initialized_ = false;
     Eigen::Matrix<double, 11, 1> X_ = Eigen::Matrix<double, 11, 1>::Zero();
@@ -199,6 +213,9 @@ private:
     double max_radius_ = 0.60;
     double max_abs_h_ = 0.40;
     double max_abs_w_ = 20.0;
+    bool freeze_radius_kalman_rows_ = false;
+    bool statistically_fixed_radius_ = false;
+    double fixed_radius_variance_ = 1e-8;
 };
 
 enum class TrackerState {
@@ -231,6 +248,28 @@ struct TrackerResult {
     double measurement_yaw = std::numeric_limits<double>::quiet_NaN();
     double predicted_yaw = std::numeric_limits<double>::quiet_NaN();
     double yaw_innovation = std::numeric_limits<double>::quiet_NaN();
+    Eigen::Matrix<double, 4, 1> measurement =
+        Eigen::Matrix<double, 4, 1>::Constant(
+            std::numeric_limits<double>::quiet_NaN());
+    Eigen::Matrix<double, 4, 1> pre_predicted =
+        Eigen::Matrix<double, 4, 1>::Constant(
+            std::numeric_limits<double>::quiet_NaN());
+    Eigen::Matrix<double, 4, 1> post_predicted =
+        Eigen::Matrix<double, 4, 1>::Constant(
+            std::numeric_limits<double>::quiet_NaN());
+    Eigen::Matrix<double, 3, 1> pre_residual =
+        Eigen::Matrix<double, 3, 1>::Constant(
+            std::numeric_limits<double>::quiet_NaN());
+    Eigen::Matrix<double, 3, 1> post_residual =
+        Eigen::Matrix<double, 3, 1>::Constant(
+            std::numeric_limits<double>::quiet_NaN());
+    double pre_position_error = std::numeric_limits<double>::quiet_NaN();
+    double post_position_error = std::numeric_limits<double>::quiet_NaN();
+    double residual_radial = std::numeric_limits<double>::quiet_NaN();
+    double residual_tangential = std::numeric_limits<double>::quiet_NaN();
+    double nis_xyz = std::numeric_limits<double>::quiet_NaN();
+    double nis_yaw = std::numeric_limits<double>::quiet_NaN();
+    double yaw_variance_scale = 1.0;
     double hypothetical_scaled_nis = std::numeric_limits<double>::quiet_NaN();
     Eigen::Matrix<double, 4, 1> hypothetical_scaled_nis_contribution =
         Eigen::Matrix<double, 4, 1>::Constant(
@@ -279,6 +318,9 @@ public:
     ArmorState state() const { return ekf_.state(); }
     std::array<double, 3> geometryVariances() const {
         return ekf_.geometryVariances();
+    }
+    std::array<double, 11> stateVariances() const {
+        return ekf_.stateVariances();
     }
     const GeometryMemory& geometryMemory() const { return geometry_memory_; }
     std::vector<ArmorObservation> predictArmors(double predict_time) const {

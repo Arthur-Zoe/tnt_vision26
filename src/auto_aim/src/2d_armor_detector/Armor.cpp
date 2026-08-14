@@ -128,6 +128,7 @@ void Armor::calculateCorners() {
     light_bar_corners.push_back(left_center + vecToPoint(left_down_vertical));
     light_bar_corners.push_back(right_center + vecToPoint(right_down_vertical));
     light_bar_corners.push_back(right_center + vecToPoint(right_up_vertical));
+    raw_detector_corners = light_bar_corners;
 
     // 沿长边部分使用小装甲板比例获得装甲板高度相对坐标
     left_up_vertical *= ArmorConstants::SMALL_HEIGHT_RATIO;

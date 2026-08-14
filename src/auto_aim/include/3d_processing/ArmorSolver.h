@@ -57,6 +57,12 @@ public:
         yaw_refinement_.min_relative_improvement =
             yaw_config["min_relative_improvement"].as<double>();
 
+        const YAML::Node pnp_diagnostic =
+            (*config_file_ptr)["pnp_diagnostic"];
+        pnp_diagnostic_enabled_ =
+            pnp_diagnostic && pnp_diagnostic["csv_enabled"] &&
+            pnp_diagnostic["csv_enabled"].as<bool>();
+
     }
     // 新增3D到像素坐标投影函数
     cv::Point2f project3DToPixel(const cv::Point3f& world_point) const;
@@ -104,6 +110,7 @@ private:
         double min_rmse_improvement_px = 0.0;
         double min_relative_improvement = 0.0;
     } yaw_refinement_;
+    bool pnp_diagnostic_enabled_ = false;
     // 用于缓存分辨率与对应最大夹角的映射（mutable 以便在 const 成员函数中修改）
     mutable std::unordered_map<std::string, double> fov_cache_;
 
