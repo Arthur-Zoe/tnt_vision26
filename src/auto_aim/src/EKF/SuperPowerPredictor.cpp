@@ -1,4 +1,4 @@
-#include "EKF/EKFTargetPredictor.h"
+#include "EKF/SuperPowerPredictor.h"
 
 #include <algorithm>
 #include <cmath>
@@ -10,11 +10,11 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
 constexpr double kHalfPi = kPi / 2.0;
 }
 
-EKFTargetPredictor::EKFTargetPredictor(
+SuperPowerPredictor::SuperPowerPredictor(
     const EKFTargetObservation& initial_observation,
     double initial_radius_mm,
     std::shared_ptr<YAML::Node> config_file_ptr) {
-    // Do not inherit any old RobustArmorTracker tuning. These defaults are
+    // Do not inherit any old previous estimator tuning. These defaults are
     // SuperPower standard3 + the normal four-armor Tracker::set_target branch.
     config_.min_detect_count = 5;
     config_.max_temp_lost_count = 15;
@@ -24,7 +24,7 @@ EKFTargetPredictor::EKFTargetPredictor(
 
     // The YAML block is deliberately a transcription of those SP constants.
     // Reading it here keeps one visible source of truth without consulting the
-    // legacy robust_ekf block.
+    // legacy previous estimator config block.
     if (config_file_ptr) {
         const YAML::Node sp = (*config_file_ptr)["superpower_ekf"];
         if (sp) {
@@ -55,7 +55,7 @@ EKFTargetPredictor::EKFTargetPredictor(
     }
 }
 
-void EKFTargetPredictor::update(const EKFTargetObservation& observation) {
+void SuperPowerPredictor::update(const EKFTargetObservation& observation) {
     time_discontinuity_ = false;
     if (!std::isfinite(observation.t)) {
         last_dt_s_ = observation.t;
@@ -101,7 +101,7 @@ void EKFTargetPredictor::update(const EKFTargetObservation& observation) {
     }
 }
 
-void EKFTargetPredictor::missUpdate(double update_time) {
+void SuperPowerPredictor::missUpdate(double update_time) {
     time_discontinuity_ = false;
     if (!std::isfinite(update_time)) {
         last_dt_s_ = update_time;
@@ -138,7 +138,7 @@ void EKFTargetPredictor::missUpdate(double update_time) {
     timestamp_warning_active_ = false;
 }
 
-void EKFTargetPredictor::clear() {
+void SuperPowerPredictor::clear() {
     resetTracker();
     last_observation_.reset();
     last_update_time_ = 0.0;
@@ -150,7 +150,7 @@ void EKFTargetPredictor::clear() {
     time_discontinuity_ = false;
 }
 
-EKFTargetPrediction EKFTargetPredictor::predict(double predict_time) const {
+EKFTargetPrediction SuperPowerPredictor::predict(double predict_time) const {
     EKFTargetPrediction result;
     if (!hasState()) return result;
 
@@ -201,7 +201,7 @@ EKFTargetPrediction EKFTargetPredictor::predict(double predict_time) const {
     return result;
 }
 
-EKFTargetState EKFTargetPredictor::state() const {
+EKFTargetState SuperPowerPredictor::state() const {
     EKFTargetState result;
     if (!hasState()) return result;
 
@@ -224,7 +224,7 @@ EKFTargetState EKFTargetPredictor::state() const {
     return result;
 }
 
-EKFTargetDebugState EKFTargetPredictor::debugState() const {
+EKFTargetDebugState SuperPowerPredictor::debugState() const {
     EKFTargetDebugState debug;
     debug.dt_s = last_dt_s_;
     debug.time_discontinuity = time_discontinuity_;
@@ -309,31 +309,31 @@ EKFTargetDebugState EKFTargetPredictor::debugState() const {
     return debug;
 }
 
-bool EKFTargetPredictor::ready() const {
+bool SuperPowerPredictor::ready() const {
     return tracker_ && tracker_->ready();
 }
 
-bool EKFTargetPredictor::hasState() const {
+bool SuperPowerPredictor::hasState() const {
     return tracker_ && tracker_->hasState();
 }
 
-void EKFTargetPredictor::warnTimeIssue(const char* reason,
+void SuperPowerPredictor::warnTimeIssue(const char* reason,
                                        double update_time,
                                        double dt) {
     if (!timestamp_warning_active_) {
-        std::cerr << "[EKFTargetPredictor/SP] warning: " << reason
+        std::cerr << "[SuperPowerPredictor] warning: " << reason
                   << "; t=" << update_time << " dt=" << dt << " s"
                   << std::endl;
         timestamp_warning_active_ = true;
     }
 }
 
-void EKFTargetPredictor::resetTracker() {
+void SuperPowerPredictor::resetTracker() {
     tracker_ = std::make_unique<sp_ekf::Tracker>(config_);
     last_result_ = sp_ekf::TrackerResult{};
 }
 
-void EKFTargetPredictor::initializeFromObservation(
+void SuperPowerPredictor::initializeFromObservation(
     const EKFTargetObservation& observation) {
     if (!tracker_) resetTracker();
     last_observation_ = toSuperPower(observation);
@@ -347,7 +347,7 @@ void EKFTargetPredictor::initializeFromObservation(
     }
 }
 
-sp_ekf::ArmorObservation EKFTargetPredictor::toSuperPower(
+sp_ekf::ArmorObservation SuperPowerPredictor::toSuperPower(
     const EKFTargetObservation& observation) {
     sp_ekf::ArmorObservation result;
     result.xyz << observation.x / kMillimetersPerMeter,
@@ -361,11 +361,11 @@ sp_ekf::ArmorObservation EKFTargetPredictor::toSuperPower(
     return result;
 }
 
-double EKFTargetPredictor::toProjectYaw(double superpower_angle) {
+double SuperPowerPredictor::toProjectYaw(double superpower_angle) {
     return wrapAngle(superpower_angle - kHalfPi);
 }
 
-double EKFTargetPredictor::wrapAngle(double angle) {
+double SuperPowerPredictor::wrapAngle(double angle) {
     while (angle > kPi) angle -= 2.0 * kPi;
     while (angle <= -kPi) angle += 2.0 * kPi;
     return angle;

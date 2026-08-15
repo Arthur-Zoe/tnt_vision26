@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -9,9 +8,6 @@
 
 #include <yaml-cpp/yaml.h>
 
-// Kept only because the existing debug/CSV/visualization ABI uses this
-// hypothesis type. RobustArmorTracker is no longer the runtime estimator.
-#include "EKF/RobustArmorTracker.h"
 #include "EKF/SuperPowerTracker.h"
 
 struct EKFTargetObservation {
@@ -59,9 +55,7 @@ struct EKFTargetState {
     unsigned long long update_frames = 0;
 };
 
-// This struct is intentionally kept source-compatible with the pre-existing
-// robust-EKF visualizer/logger. Fields that only existed for the old phase
-// observer/reversal recovery stay at their neutral defaults under SP-EKF.
+// SuperPower tracker state exported to the runtime visualization/fire-control layer.
 struct EKFTargetDebugState {
     double dt_s = 0.0;
     bool time_discontinuity = false;
@@ -126,16 +120,14 @@ struct EKFTargetDebugState {
     bool geometry_update_allowed = false;
     bool geometry_preserved = false;
     int current_armor_id = -1;
-    std::array<rm_ekf::AssociationHypothesisDebug, 4>
-        association_hypotheses;
 };
 
-// Boundary adapter around the SuperPower 2025 normal four-armor
-// Target/Tracker/EKF path.  Internally SP units/conventions are preserved;
+// Runtime adapter around the SuperPower 2025 normal four-armor
+// Target/Tracker/EKF path. Internally SP units/conventions are preserved;
 // this class only converts project millimetres/timestamps/yaw convention.
-class EKFTargetPredictor {
+class SuperPowerPredictor {
 public:
-    EKFTargetPredictor(const EKFTargetObservation& initial_observation,
+    SuperPowerPredictor(const EKFTargetObservation& initial_observation,
                        double initial_radius_mm,
                        std::shared_ptr<YAML::Node> config_file_ptr);
 

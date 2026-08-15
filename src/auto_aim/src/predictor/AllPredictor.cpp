@@ -334,7 +334,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
             }
 
             if (recreate_model) {
-                ekf_target_predictor_ = std::make_shared<EKFTargetPredictor>(
+                ekf_target_predictor_ = std::make_shared<SuperPowerPredictor>(
                     RMM_update_data, init_r, config_file_ptr);
             } else {
                 ekf_target_predictor_->update(RMM_update_data);
@@ -494,8 +494,6 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
                 RMM_debug.measurement_valid;
             result.geometry_debug.current_armor_id =
                 RMM_debug.current_armor_id;
-            result.geometry_debug.association_hypotheses =
-                RMM_debug.association_hypotheses;
             if (result.yaw_debug.available) {
                 result.yaw_debug.ekf_yaw_rad = RMM_state.yaw;
                 result.yaw_debug.ekf_w_rad_s = RMM_state.w;
@@ -1104,7 +1102,7 @@ PredictorResult AllPredictor::step(std::vector<ArmorResult>& classifyResults,
     const std::string predictor_status =
         (armor_class == ArmorType::Base || armor_class == ArmorType::Outpost)
             ? "DIRECT"
-            : "EKF";
+            : "SP-EKF";
     cv::putText(frame, 
         "Class "+std::to_string(armor_class)+": "+predictor_status,
         cv::Point2f(frame.cols - 200, 50 + 30 * armor_class), 
