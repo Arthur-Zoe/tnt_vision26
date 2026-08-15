@@ -5,7 +5,6 @@
 #include <functional>
 #include <map>
 #include <string>
-#include <vector>
 
 // Ported from TongjiSuperPower/sp_vision_25
 // Source commit: ce3e1ce05ea57bef9813bba0c450ff158388f0a2
@@ -56,8 +55,7 @@ public:
                                       const Eigen::VectorXd&)> z_subtract =
             [](const Eigen::VectorXd& a, const Eigen::VectorXd& b) {
                 return a - b;
-            },
-        const std::vector<int>& frozen_state_indices = {});
+            });
 
     std::map<std::string, double> data;
     std::deque<int> recent_nis_failures{0};
