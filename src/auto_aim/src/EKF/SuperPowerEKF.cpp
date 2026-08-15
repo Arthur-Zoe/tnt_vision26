@@ -56,18 +56,10 @@ Eigen::VectorXd ExtendedKalmanFilter::update(
     const Eigen::MatrixXd& R,
     std::function<Eigen::VectorXd(const Eigen::VectorXd&)> h,
     std::function<Eigen::VectorXd(const Eigen::VectorXd&,
-                                  const Eigen::VectorXd&)> z_subtract,
-    const std::vector<int>& frozen_state_indices) {
+                                  const Eigen::VectorXd&)> z_subtract) {
     const Eigen::VectorXd x_prior = x;
     Eigen::MatrixXd K =
         P * H.transpose() * (H * P * H.transpose() + R).inverse();
-
-    // Project-specific vertical stabilization: on an armor-topology switch,
-    // Target can freeze selected state rows in the correction.  The normal
-    // path passes an empty list and remains identical to SuperPower.
-    for (const int index : frozen_state_indices) {
-        if (index >= 0 && index < K.rows()) K.row(index).setZero();
-    }
 
     // Joseph-form covariance update, matching SuperPower.
     P = (I_ - K * H) * P * (I_ - K * H).transpose() + K * R * K.transpose();

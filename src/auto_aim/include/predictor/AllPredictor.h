@@ -19,7 +19,7 @@
 #include "3d_processing/RestFrame.h"
 #include "visualizer/DataVisualizer.h"
 #include "utils/SimpleDataFilter.h"
-#include "EKF/EKFTargetPredictor.h"
+#include "EKF/SuperPowerPredictor.h"
 #include "macro/AutoAimMacro.h"
 
 struct YawMeasurementDebug {
@@ -119,8 +119,6 @@ struct GeometryDebug {
     bool updated = false;
     bool measurement_valid = false;
     int current_armor_id = -1;
-    std::array<rm_ekf::AssociationHypothesisDebug, 4>
-        association_hypotheses;
 };
 
 struct PredictorResult {
@@ -224,7 +222,7 @@ private:
 
     std::shared_ptr<Oscilloscope> oscilloscope_common_;
 
-    std::shared_ptr<EKFTargetPredictor> ekf_target_predictor_;
+    std::shared_ptr<SuperPowerPredictor> ekf_target_predictor_;
 
     float bullet_velocity_;
     float last_pitch_rad_delayed_ = 0;

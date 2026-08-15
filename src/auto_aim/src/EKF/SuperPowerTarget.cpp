@@ -160,25 +160,7 @@ void Target::updateYpda(const ArmorObservation& armor, int id) {
 
     Eigen::VectorXd z(4);
     z << ypd[0], ypd[1], ypd[2], armor.angle;
-    // Vertical observability fix for the single-armor input used by this
-    // project.  For a four-armor target, E0/E2 measure the base layer z, while
-    // E1/E3 measure z+h.  While only an odd armor is visible, z and h are not
-    // separately observable from that one measurement.  Allowing the normal
-    // Kalman gain to update both makes the whole target drift vertically after
-    // a switch.
-    //
-    // Keep E0/E2 as the anchor for center z.  During every E1/E3 update (not
-    // just the first switch frame), freeze center z and vz so the vertical
-    // innovation is absorbed by h.  This leaves SP's XY/yaw/w/r/l update path
-    // unchanged and makes the two armor layers explicit:
-    //   E0/E2: z_armour = center_z
-    //   E1/E3: z_armour = center_z + h
-    const bool odd_height_layer =
-        armor_num_ == 4 && (id == 1 || id == 3);
-    const std::vector<int> frozen_states = odd_height_layer
-        ? std::vector<int>{4, 5}
-        : std::vector<int>{};
-    ekf_.update(z, H, R, h, z_subtract, frozen_states);
+    ekf_.update(z, H, R, h, z_subtract);
 }
 
 Eigen::VectorXd Target::ekfX() const { return ekf_.x; }

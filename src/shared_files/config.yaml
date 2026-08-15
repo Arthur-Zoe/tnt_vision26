@@ -65,119 +65,13 @@ pnp_diagnostic:
 
 
 # 11D whole-vehicle EKF for normal four-armor vehicles.
-# SuperPower 2025 EKF baseline now used by EKFTargetPredictor.
-# Source code baseline: TongjiSuperPower/sp_vision_25
-# commit ce3e1ce05ea57bef9813bba0c450ff158388f0a2
-# Normal four-armor branch from configs/standard3.yaml / Tracker::set_target().
+# SuperPower 2025 EKF baseline used by SuperPowerPredictor.
 superpower_ekf:
   min_detect_count: 5
   max_temp_lost_count: 15
   max_dt_s: 0.1
-  initial_radius_m: 0.2
+  initial_radius_m: 0.3
   armor_num: 4
-
-# Internal EKF units are meter / second / radian.
-# LEGACY / INACTIVE: previous RobustArmorTracker tuning retained only for
-# rollback/reference. EKFTargetPredictor no longer reads this block.
-robust_ekf:
-  # Initialization used by the standalone v4 replay that passed the recorded-data test.
-  # These are meters. For a different physical robot, replace them with its measured geometry.
-  initial_r1: 0.5
-  initial_r2: 0.5
-  initial_h: 0.03
-
-  # Continuous-time process-noise standard deviations. At 30 FPS the
-  # acceleration terms preserve the old velocity noise, while position/yaw
-  # random walks restore the old position/yaw diagonal noise.
-  process_noise:
-    sigma_acc_xy: 3.0           # m/s^2
-    sigma_acc_z: 3.0            # m/s^2
-    sigma_angular_acc: 2.12132  # rad/s^2
-    sigma_pos_rw_xy: 0.054006   # m/sqrt(s)
-    sigma_pos_rw_z: 0.054006    # m/sqrt(s)
-    sigma_yaw_rw: 0.054391      # rad/sqrt(s)
-    sigma_radius_rw: 0.0        # static geometry baseline
-    sigma_height_rw: 0.0        # static geometry baseline
-
-  geometry:
-    stable_frames_before_update: 5
-    # G2 diagnostic only: zero radius Kalman correction rows without clamping
-    # radius state values. Keep false for the normal learned-geometry G1 run.
-    freeze_radius_kalman_rows: true
-    # G2b diagnostic: additionally make the fixed radii statistically certain.
-    # Radius rows/columns are isolated after every predict/update.
-    statistically_fixed_radius: true
-    fixed_radius_variance: 1.0e-8
-    reinit_covariance_floor:
-      enabled: false
-      radius_variance: 0.0005
-      height_variance: 0.0005
-    debug_csv: false
-    debug_csv_path: "/tmp/geometry_debug.csv"
-    association_debug_csv: false
-    association_debug_csv_path: "/tmp/association_debug.csv"
-    lifecycle_debug_csv: false
-    lifecycle_debug_csv_path: "/tmp/lifecycle_debug.csv"
-
-  # Provisional evaluation references only. They are never used by EKF update,
-  # constraints, association, or geometry initialization.
-  geometry_debug_reference:
-    r1: 0.5
-    r2: 0.5
-    h: 0.03
-    r1_tolerance: 0.03
-    r2_tolerance: 0.03
-    h_tolerance: 0.02
-
-  # Measurement covariance terms (variance, not standard deviation).
-  r_pos: 0.002
-  r_z: 0.002
-  r_yaw: 0.002
-
-  state_min_radius: 0.08
-  state_max_radius: 0.60
-  state_max_abs_h: 0.40
-  state_max_abs_w: 20.0
-
-  detect_confirm_frames: 3
-  detect_max_misses: 2
-  temp_lost_max_frames: 12
-
-  association_nis_gate: 13.28
-  association_switch_nis_margin: 1.50
-  association_max_position_error: 0.80
-  association_max_yaw_error_deg: 65.0
-
-  # 用于旋转相位观测器的参数，
-  rotation_phase_observer_enable: true
-  rotation_phase_alpha: 0.70
-  rotation_phase_max_abs_omega: 15.0
-  rotation_phase_max_step_deg: 35.0
-  rotation_phase_min_dt: 0.005
-  rotation_phase_max_dt: 0.20
-  rotation_phase_w_variance: 0.10
-  rotation_reversal_min_abs_omega: 0.60
-  rotation_reversal_confirm_frames: 2
-  rotation_reversal_w_variance: 0.015
-  rotation_switch_yaw_r_scale: 9.0
-
-  input_min_range: 0.20
-  input_max_range: 8.00
-  input_max_abs_z: 2.50
-  armor_visible_angle_deg: 70.0
-
-# Source-timestamp EKF time-series diagnostics. Plotting and CSV logging are
-# independent and default off in normal runtime.
-ekf_debug_plot:
-  enabled: false
-  history_seconds: 10.0
-  width: 1280
-  panel_height: 120
-  csv_enabled: false
-  csv_path: "/tmp/ekf_debug.csv"
-  save_latest_png: false
-  screenshot_path: "/tmp/ekf_debug_curves.png"
-
 
 frame_rate : 30.0   # fps
 serial_delay_time : 30.0 # ms           电控传来的信息相对相机画面快的时间，将对电控信息再延迟这个时间以同步两者

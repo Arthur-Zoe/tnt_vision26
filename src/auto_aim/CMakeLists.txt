@@ -69,8 +69,7 @@ add_library(armor_detector SHARED
     src/EKF/SuperPowerEKF.cpp
     src/EKF/SuperPowerTarget.cpp
     src/EKF/SuperPowerTracker.cpp
-    src/EKF/EKFTargetPredictor.cpp
-    src/EKF/EKFDebugPlotter.cpp
+    src/EKF/SuperPowerPredictor.cpp
     src/predictor/AllPredictor.cpp
     src/predictor/TargetManager.cpp
     src/predictor/PredictorMain.cpp
