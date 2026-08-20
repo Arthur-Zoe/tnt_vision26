@@ -21,7 +21,7 @@ delta_z_ : 30.0   # 待修正
 pc_ip : "192.168.10.25"
 cam_ip : "192.168.10.10"
 
-video_relative_path : "InputVideo/infantry_blue.mp4"    # 使用视频输入时的视频路径
+video_relative_path : "InputVideo/Video_20260819095627436.avi"    # 使用视频输入时的视频路径
 images_relative_path : "InputImages"                    # 使用图片输入时的图片文件夹路径
 
 RMM_visualize_zoom_out_factor : 10.0 # 平面可视化缩放系数，该值越大视野范围越大
@@ -67,10 +67,10 @@ pnp_diagnostic:
 # 11D whole-vehicle EKF for normal four-armor vehicles.
 # SuperPower 2025 EKF baseline used by SuperPowerPredictor.
 superpower_ekf:
-  min_detect_count: 5
-  max_temp_lost_count: 15
+  min_detect_count: 3
+  max_temp_lost_count: 10
   max_dt_s: 0.1
-  initial_radius_m: 0.3
+  initial_radius_m: 0.38
   armor_num: 4
 
 frame_rate : 30.0   # fps

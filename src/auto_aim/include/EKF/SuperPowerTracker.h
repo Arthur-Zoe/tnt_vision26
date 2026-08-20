@@ -10,6 +10,8 @@
 namespace sp_ekf {
 
 enum class TrackerState {
+    // LOST 无可用目标；DETECTING 累计初始检测；TRACKING 稳定跟踪；
+    // TEMP_LOST 在短暂失检期间仅预测，等待重获。
     LOST,
     DETECTING,
     TRACKING,
@@ -17,7 +19,7 @@ enum class TrackerState {
 };
 
 struct TrackerConfig {
-    // SuperPower standard3.yaml defaults.
+    // SuperPower standard3.yaml 的普通四装甲默认参数。
     int min_detect_count = 5;
     int max_temp_lost_count = 15;
     double max_dt_s = 0.1;
@@ -26,6 +28,7 @@ struct TrackerConfig {
 };
 
 struct TrackerResult {
+    // process() 单帧结果：同时保留调用前后的状态，便于外层记录状态转移。
     TrackerState state = TrackerState::LOST;
     TrackerState state_before = TrackerState::LOST;
     bool initialized_this_frame = false;
@@ -44,13 +47,13 @@ class Tracker {
 public:
     explicit Tracker(const TrackerConfig& config = TrackerConfig{});
 
+    // 处理一帧可选观测：有观测时预测并更新，无观测时只预测。
     TrackerResult process(const std::optional<ArmorObservation>& observation,
                           double dt);
     void clear();
 
-    // SuperPower keeps the last Target object internally after entering LOST,
-    // but does not return it to downstream modules. Mirror that observable
-    // behavior here: LOST means no usable state.
+    // SP 进入 LOST 后可能仍在内部缓存 Target，但不会把它提供给下游。
+    // 此处保持同一可观察语义：LOST 一律视为没有可用状态。
     bool hasState() const {
         return state_ != TrackerState::LOST && target_.has_value();
     }
@@ -63,12 +66,15 @@ public:
     }
 
 private:
+    // 状态机计数器：detect_count_ 用于确认建目标，temp_lost_count_ 用于
+    // 限制仅预测的连续帧数。
     TrackerConfig config_;
     int detect_count_ = 0;
     int temp_lost_count_ = 0;
     TrackerState state_ = TrackerState::LOST;
     std::optional<Target> target_;
 
+    // 状态机辅助操作，以及普通四装甲初始协方差的构造。
     bool setTarget(const ArmorObservation& observation);
     TargetUpdateDebug updateTarget(const ArmorObservation& observation,
                                    double dt);

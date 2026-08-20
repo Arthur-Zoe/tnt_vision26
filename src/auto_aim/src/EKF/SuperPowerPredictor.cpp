@@ -5,6 +5,7 @@
 #include <iostream>
 
 namespace {
+// 项目层与 SP 内部单位/角度转换所需常量。
 constexpr double kMillimetersPerMeter = 1000.0;
 constexpr double kPi = 3.141592653589793238462643383279502884;
 constexpr double kHalfPi = kPi / 2.0;
@@ -14,17 +15,14 @@ SuperPowerPredictor::SuperPowerPredictor(
     const EKFTargetObservation& initial_observation,
     double initial_radius_mm,
     std::shared_ptr<YAML::Node> config_file_ptr) {
-    // Do not inherit any old previous estimator tuning. These defaults are
-    // SuperPower standard3 + the normal four-armor Tracker::set_target branch.
+    // 不继承旧估计器调参；以下默认值来自 SP standard3 与普通四装甲 set_target 分支。
     config_.min_detect_count = 5;
     config_.max_temp_lost_count = 15;
     config_.max_dt_s = 0.1;
     config_.initial_radius_m = 0.2;
     config_.armor_num = 4;
 
-    // The YAML block is deliberately a transcription of those SP constants.
-    // Reading it here keeps one visible source of truth without consulting the
-    // legacy previous estimator config block.
+    // YAML 块只覆盖这些 SP 常量，集中管理配置来源，且不读取旧估计器配置。
     if (config_file_ptr) {
         const YAML::Node sp = (*config_file_ptr)["superpower_ekf"];
         if (sp) {
@@ -41,8 +39,8 @@ SuperPowerPredictor::SuperPowerPredictor(
         }
     }
 
-    // Keep the old constructor ABI. SP's normal branch initializes at 0.2 m,
-    // so the previous caller-provided RMM radius must not alter the baseline.
+    // 保持旧构造函数 ABI。SP 普通分支固定以 0.2 m 初始化，调用方旧 RMM 半径
+    // 不得改变该基线。
     (void)initial_radius_mm;
 
     resetTracker();
@@ -63,6 +61,7 @@ void SuperPowerPredictor::update(const EKFTargetObservation& observation) {
         return;
     }
 
+    // 首帧只建目标和时间基准，dt 固定为 0，不做跨帧预测。
     if (!has_update_time_) {
         initializeFromObservation(observation);
         timestamp_warning_active_ = false;
@@ -80,12 +79,13 @@ void SuperPowerPredictor::update(const EKFTargetObservation& observation) {
         return;
     }
 
-    // Do not pre-reset at the old RMM reset_predictor_time.  The SP tracker
-    // itself applies its original 0.1 s large-dt reset behavior.
+    // 不在旧 RMM reset_predictor_time 阈值处预复位；SP 跟踪器自行保持原始的
+    // 0.1 s 大 dt 复位行为。
     if (dt > config_.max_dt_s) {
         time_discontinuity_ = true;
     }
 
+    // 单位/坐标转换只发生在适配器边界，底层 Tracker 始终使用 SP 约定。
     last_observation_ = toSuperPower(observation);
     last_result_ = tracker_->process(last_observation_, dt);
     last_update_time_ = observation.t;
@@ -109,6 +109,7 @@ void SuperPowerPredictor::missUpdate(double update_time) {
         return;
     }
 
+    // 尚未收到任何观测时，空帧只能建立时间基准，不能创建 Target。
     if (!has_update_time_) {
         last_update_time_ = update_time;
         last_dt_s_ = 0.0;
@@ -157,6 +158,7 @@ EKFTargetPrediction SuperPowerPredictor::predict(double predict_time) const {
     const sp_ekf::Target* target = tracker_->target();
     if (!target) return result;
 
+    // 不修改滤波器后验状态；复制后按匀速/匀角速模型进行纯前向外推。
     Eigen::VectorXd x = target->ekfX();
     x[0] += x[1] * predict_time;
     x[2] += x[3] * predict_time;
@@ -178,6 +180,7 @@ EKFTargetPrediction SuperPowerPredictor::predict(double predict_time) const {
     result.w = x[7];
     result.rotation_direction = x[7] >= 0.0 ? 1 : -1;
 
+    // 由外推后的中心、相位和交替 r/l/h 几何重建每块装甲。
     const int armor_num = target->armorNum();
     result.armors.reserve(static_cast<std::size_t>(armor_num));
     for (int id = 0; id < armor_num; ++id) {
@@ -208,6 +211,7 @@ EKFTargetState SuperPowerPredictor::state() const {
     const sp_ekf::Target* target = tracker_->target();
     if (!target) return result;
 
+    // 该接口导出当前后验，不包含 predict() 的未来外推。
     const Eigen::VectorXd x = target->ekfX();
     result.center_x = x[0] * kMillimetersPerMeter;
     result.center_vx = x[1] * kMillimetersPerMeter;
@@ -225,6 +229,7 @@ EKFTargetState SuperPowerPredictor::state() const {
 }
 
 EKFTargetDebugState SuperPowerPredictor::debugState() const {
+    // 仅镜像 Tracker/EKF 的已有诊断值，不能影响正式跟踪或火控决策。
     EKFTargetDebugState debug;
     debug.dt_s = last_dt_s_;
     debug.time_discontinuity = time_discontinuity_;
@@ -252,6 +257,7 @@ EKFTargetDebugState SuperPowerPredictor::debugState() const {
                              ? last_result_.matched_id % 2
                              : -1;
 
+    // 观测在内部是 m/SP 角度；导出时保留 m 但转换为项目 yaw 约定。
     if (last_observation_) {
         debug.measurement << last_observation_->xyz[0],
                              last_observation_->xyz[1],
@@ -276,6 +282,7 @@ EKFTargetDebugState SuperPowerPredictor::debugState() const {
     }
 
     const sp_ekf::Target* target = tracker_->target();
+    // 从后验状态和协方差抽取几何参数，供可视化定位问题。
     if (hasState() && target) {
         const Eigen::VectorXd x = target->ekfX();
         const Eigen::MatrixXd& P = target->ekf().P;
@@ -320,6 +327,7 @@ bool SuperPowerPredictor::hasState() const {
 void SuperPowerPredictor::warnTimeIssue(const char* reason,
                                        double update_time,
                                        double dt) {
+    // 同一段异常时间序列只告警一次，避免日志被重复帧淹没。
     if (!timestamp_warning_active_) {
         std::cerr << "[SuperPowerPredictor] warning: " << reason
                   << "; t=" << update_time << " dt=" << dt << " s"
@@ -329,6 +337,7 @@ void SuperPowerPredictor::warnTimeIssue(const char* reason,
 }
 
 void SuperPowerPredictor::resetTracker() {
+    // 重新创建 Tracker 同时清空其结果快照；时间状态由调用方单独复位。
     tracker_ = std::make_unique<sp_ekf::Tracker>(config_);
     last_result_ = sp_ekf::TrackerResult{};
 }
@@ -336,6 +345,7 @@ void SuperPowerPredictor::resetTracker() {
 void SuperPowerPredictor::initializeFromObservation(
     const EKFTargetObservation& observation) {
     if (!tracker_) resetTracker();
+    // 以 dt=0 建立初始 Target，防止把首帧时间绝对值误当作时间间隔。
     last_observation_ = toSuperPower(observation);
     last_result_ = tracker_->process(last_observation_, 0.0);
     last_update_time_ = observation.t;
@@ -354,9 +364,9 @@ sp_ekf::ArmorObservation SuperPowerPredictor::toSuperPower(
                   observation.y / kMillimetersPerMeter,
                   observation.z / kMillimetersPerMeter;
 
-    // Current project geometry uses p = c + r*[sin(yaw), -cos(yaw)].
-    // SuperPower uses p = c - r*[cos(angle), sin(angle)].
-    // angle = yaw + pi/2 makes the two definitions identical.
+    // 项目几何：p = c + r*[sin(yaw), -cos(yaw)]。
+    // SP 几何：p = c - r*[cos(angle), sin(angle)]。
+    // 令 angle = yaw + pi/2 后，两种定义完全等价。
     result.angle = wrapAngle(observation.yaw + kHalfPi);
     return result;
 }
